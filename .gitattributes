@@ -1,0 +1,3 @@
+# 本仓库是「字节级回滚保险」：禁止任何行尾/编码转换，
+# 否则 Windows 上 core.autocrlf 会把 client.js 的 LF 改成 CRLF，回滚出来的字节数对不上。
+* -text

@@ -1,0 +1,5 @@
+# 只插一行 Host 插件；客户端渲染由 package.json 的 dsh.client 指向 ./client.js（同包根目录）。
+# 拆成两行会让「插件页里关掉那一行」时界面还在、接口却 404，所以不要再单独插 Host 行。
+- insert:
+    - id: sw-3d-preview
+      name: '@local/dsh-sw-3d-preview'

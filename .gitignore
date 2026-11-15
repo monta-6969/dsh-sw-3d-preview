@@ -1,0 +1,9 @@
+# 第三方副本（2.1 MB，可由 scripts 重新生成；不是本插件的源码）
+vendor/three.cjs
+
+# 依赖与日志
+node_modules/
+*.log
+
+# 快照记录（每次跑 tools/snapshot.mjs 追加，本地产物，不入版本）
+snapshots.jsonl

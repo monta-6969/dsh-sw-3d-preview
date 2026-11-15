@@ -1,0 +1,36 @@
+{
+  "name": "@local/dsh-sw-3d-preview",
+  "version": "0.2.0",
+  "private": true,
+  "description": "在文件预览面板里查看 3D 成果：STEP/STL/OBJ → S3DM v2 网格，支持面/边拾取、三点法标注、剖切封盖与标注交接单",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "lib",
+    "vendor"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-documentpreview"
+      ]
+    }
+  }
+}
