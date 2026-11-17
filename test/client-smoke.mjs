@@ -18,6 +18,13 @@ const clientPath = process.env.SW3D_CLIENT
 const source = fs.readFileSync(clientPath, 'utf8');
 console.log('# client.js: ' + clientPath + ' (' + source.length + ' bytes)');
 
+// 精度档的「真实来源」在宿主侧：lib/resolve.js 的 PRECISION_TIERS（档位 → 缓存键/三角化参数）
+// 和 lib/mesh.js 的 DEFAULT_DEFLECTION_MM（不传参时的默认弦高）。client.js 里是同名副本，
+// lib/resolve.js:577 的注释把「两边必须一致」写成硬约束，所以这里直接读宿主表来比对，
+// 而不是在测试里再抄一份数字（抄的那份迟早和两边都对不上）。
+const { PRECISION_TIERS: HOST_PRECISION_TIERS } = await import('../lib/resolve.js');
+const { DEFAULT_DEFLECTION_MM: HOST_DEFAULT_DEFLECTION_MM } = await import('../lib/mesh.js');
+
 const results = [];
 function check(name, fn) {
   try {
@@ -407,7 +414,7 @@ function runBundle() {
 check('client.js loads and calls __ModuleLoader__.load once', () => {
   runBundle();
   assert.ok(loadedSpec, '__ModuleLoader__.load was not called');
-  assert.equal(loadedSpec.id, '@local/dsh-sw-3d-preview');
+  assert.equal(loadedSpec.id, 'dsh-sw-3d-preview');
   assert.equal(typeof loadedSpec.factory, 'function');
 });
 
@@ -528,7 +535,11 @@ check('built-in S3DM sample: v2 header / faceEdge / triangleCount / bbox / polyl
   assert.deepEqual(model.faceEdgeIndex.byFace.get(0), [0]);
   assert.deepEqual(model.faceEdgeIndex.byFace.get(1), [0]);
   assert.deepEqual(model.faceEdgeIndex.byEdge.get(0), [0, 1]);
-  assert.deepEqual(model.precision, { deflectionMm: 0.2, maxTriangles: 300000 });
+  // 客户端默认档的精度必须与宿主解析结果一致（宿主默认档 = PRECISION_TIERS.mid）
+  assert.deepEqual(model.precision, {
+    deflectionMm: HOST_PRECISION_TIERS.mid.deflection,
+    maxTriangles: HOST_PRECISION_TIERS.mid.maxTriangles,
+  });
 });
 
 check('parseS3DM also accepts legacy absolute buffer offsets', () => {
@@ -912,14 +923,54 @@ check('trimMeshCache: 条目上限与字节预算都会淘汰最旧项', () => {
   assert.deepEqual([...cache2.keys()], ['m2', 'm3', 'm4']);
 });
 
-check('precision tiers: high/mid/low → deflection + maxTriangles', () => {
-  assert.deepEqual(T.PRECISION_TIERS.high, { key: 'high', label: '高', deflection: 0.1, maxTriangles: 900000 });
-  assert.deepEqual(T.PRECISION_TIERS.mid, { key: 'mid', label: '中', deflection: 0.2, maxTriangles: 300000 });
-  assert.deepEqual(T.PRECISION_TIERS.low, { key: 'low', label: '低', deflection: 0.5, maxTriangles: 120000 });
+check('precision tiers: high/mid/low → deflection + maxTriangles（必须与 lib/resolve.js 的同名表一致）', () => {
+  // 期望值取自宿主真实来源 lib/resolve.js，而不是在测试里再抄一遍数字：
+  // 这条正是 lib/resolve.js:577 那条契约（「改这组数时必须同时改 client.js 的同名表」）的可执行版本。
+  // label / key 是客户端独有的展示字段，仍然逐字断言（deepEqual 保证不多不少）。
+  assert.deepEqual(T.PRECISION_TIERS.high, {
+    key: 'high', label: '高',
+    deflection: HOST_PRECISION_TIERS.high.deflection,
+    maxTriangles: HOST_PRECISION_TIERS.high.maxTriangles,
+  });
+  assert.deepEqual(T.PRECISION_TIERS.mid, {
+    key: 'mid', label: '中',
+    deflection: HOST_PRECISION_TIERS.mid.deflection,
+    maxTriangles: HOST_PRECISION_TIERS.mid.maxTriangles,
+  });
+  assert.deepEqual(T.PRECISION_TIERS.low, {
+    key: 'low', label: '低',
+    deflection: HOST_PRECISION_TIERS.low.deflection,
+    maxTriangles: HOST_PRECISION_TIERS.low.maxTriangles,
+  });
   assert.equal(T.DEFAULT_PRECISION, 'mid');
-  assert.equal(T.precisionTierOf('low').deflection, 0.5);
+  assert.equal(T.precisionTierOf('low').deflection, HOST_PRECISION_TIERS.low.deflection);
   assert.equal(T.precisionTierOf('nonsense').key, 'mid', '未知档回落到中精度');
   assert.equal(T.LARGE_MODEL_TRIANGLES, 500000);
+  // 不传 precision、只带 deflection 的路径用 DEFAULT_DEFLECTION：它必须等于宿主默认弦高，
+  // 否则「只发 deflection」的请求会落到和宿主默认不同的缓存键上。
+  assert.equal(T.DEFAULT_DEFLECTION, HOST_DEFAULT_DEFLECTION_MM);
+  // 三档 deflection 必须严格递增（高精度数值更小），防止有人把表改反
+  assert.ok(T.PRECISION_TIERS.high.deflection < T.PRECISION_TIERS.mid.deflection);
+  assert.ok(T.PRECISION_TIERS.mid.deflection < T.PRECISION_TIERS.low.deflection);
+  // 默认档的 deflection 必须与 DEFAULT_DEFLECTION 相等（不传参 == 传 mid）
+  assert.equal(T.PRECISION_TIERS[T.DEFAULT_PRECISION].deflection, T.DEFAULT_DEFLECTION,
+    '默认档与 DEFAULT_DEFLECTION 必须是同一个数，否则「不传参」和「传 mid」两条路径分叉');
+});
+
+check('precision tier titles 显示表里的真实毫米数（不写死文案）', () => {
+  const expected = (name) => {
+    const tier = T.PRECISION_TIERS[name];
+    const wan = Number(tier.maxTriangles) / 10000;
+    return tier.label + '精度（deflaction ' + Number((Math.round(tier.deflection * 100) / 100)) +
+      '，三角形上限 ' + Number((Math.round(wan * 100) / 100)) + ' 万）';
+  };
+  for (const name of ['high', 'mid', 'low']) {
+    assert.equal(T.precisionTierTitle(name), expected(name));
+  }
+  // 逐字钉住当前档位的文案（数字变了这里会红，提醒去改 README 与表）
+  assert.equal(T.precisionTierTitle('high'), '高精度（deflaction 0.04，三角形上限 90 万）');
+  assert.equal(T.precisionTierTitle('mid'), '中精度（deflaction 0.08，三角形上限 30 万）');
+  assert.equal(T.precisionTierTitle('low'), '低精度（deflaction 0.2，三角形上限 12 万）');
 });
 
 /* ------------------------------------------------------------------ */
@@ -1350,7 +1401,8 @@ await checkAsync('loadModelData: ping -> resolve -> mesh -> parse, with progress
   assert.ok(meshUrl.indexOf('/sw3d/mesh?path=') === 0, meshUrl);
   assert.ok(meshUrl.indexOf('refresh=0') > 0, meshUrl);
   assert.ok(meshUrl.indexOf('precision=mid') > 0, '默认精度档要带给宿主：' + meshUrl);
-  assert.ok(meshUrl.indexOf('maxTriangles=300000') > 0, meshUrl);
+  assert.ok(meshUrl.indexOf('maxTriangles=' + HOST_PRECISION_TIERS.mid.maxTriangles) > 0, meshUrl);
+  assert.ok(meshUrl.indexOf('deflection=' + HOST_PRECISION_TIERS.mid.deflection) > 0, meshUrl);
 
   // reopening the same file must not hit the host again
   await T.loadModelData('C:\\work\\parts\\锁盖.STEP', { fileName: '锁盖.STEP', fileExt: 'STEP' });
@@ -1489,8 +1541,9 @@ await checkAsync('precision tiers get independent cache entries and URL params',
   assert.equal(host.counts.mesh, 1);
   const lowUrl = host.urls[host.urls.length - 1];
   assert.ok(lowUrl.indexOf('precision=low') > 0, lowUrl);
-  assert.ok(lowUrl.indexOf('maxTriangles=120000') > 0, lowUrl);
-  assert.ok(lowUrl.indexOf('deflection=0.5') > 0, lowUrl);
+  assert.ok(lowUrl.indexOf('maxTriangles=' + HOST_PRECISION_TIERS.low.maxTriangles) > 0, lowUrl);
+  assert.ok(lowUrl.indexOf('deflection=' + HOST_PRECISION_TIERS.low.deflection) > 0,
+    'URL 里的 deflection 必须等于宿主 low 档的弦高：' + lowUrl);
   assert.equal(T.meshCache.size, 1);
 
   await T.fetchMeshBuffer('C:\\work\\parts\\锁盖.STEP', 'high', false);
@@ -1498,7 +1551,9 @@ await checkAsync('precision tiers get independent cache entries and URL params',
   assert.equal(T.meshCache.size, 2);
   const highUrl = host.urls[host.urls.length - 1];
   assert.ok(highUrl.indexOf('precision=high') > 0, highUrl);
-  assert.ok(highUrl.indexOf('maxTriangles=900000') > 0, highUrl);
+  assert.ok(highUrl.indexOf('maxTriangles=' + HOST_PRECISION_TIERS.high.maxTriangles) > 0, highUrl);
+  assert.ok(highUrl.indexOf('deflection=' + HOST_PRECISION_TIERS.high.deflection) > 0,
+    'URL 里的 deflection 必须等于宿主 high 档的弦高：' + highUrl);
 
   await T.fetchMeshBuffer('C:\\work\\parts\\锁盖.STEP', 'high', false);
   assert.equal(host.counts.mesh, 2, '同档重复请求应命中缓存');
@@ -2361,6 +2416,16 @@ check('草图悬停尺寸列表：逐字符（有尺寸 / 无尺寸 / 整数与�
   assert.equal(T.buildSketchLabelText(SKETCH_SAMPLE) + '\n' + T.sketchDimensionsText(SKETCH_SAMPLE),
     'Sketch1 · 凸台-拉伸1\nD1 = 54 mm，D2 = 30 mm');
 });
+
+/* ------------------------------------------------------------------ */
+/* 草图解析（宿主侧纯函数，真实 project 数据的内联 fixture）              */
+/* ------------------------------------------------------------------ */
+
+// 从 lib/sketches.js 直接 import 纯函数断言：不走 client bundle（宿主半边是独立模块）。
+// 真实 fracture-section-01.json 的 features 原文以 fixture 形式内联在 sketch-parse.mjs 里，
+// 测试运行时**不读** %LOCALAPPDATA% 下的绝对路径。
+const sketchParse = await import('./sketch-parse.mjs');
+sketchParse.registerSketchParseTests(check);
 
 /* ------------------------------------------------------------------ */
 /* summary                                                             */

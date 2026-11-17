@@ -6,7 +6,8 @@
 不 import、不修改 sw-mcp 仓库里的任何文件；思路与其 worker.py 一致但代码是独立写的。
 
 用法：
-    python step_mesh.py --in <step> --out <s3dm> --deflection 0.2 [--source-path <原始路径>]
+    python step_mesh.py --in <step> --out <s3dm> --deflection 0.08 [--crease-angle 35]
+                        [--angular-deflection 0.12] [--source-path <原始路径>]
 
 退出码：
     0  成功（stdout 一行 JSON 摘要）
@@ -18,6 +19,14 @@
 输出约定：
     - stdout 最后一行 JSON 是给 Node 解析的摘要/错误体，其它行都不以 '{' 开头。
     - stderr 是人看的诊断（Node 侧只回传尾部 800 字符）。
+
+法线约定（v2 起）：
+    - 顶点按「写入 buffer 的精度」焊接（位置键 = rnd(coord, 5) 后的三元组），
+      多面共享同一个顶点索引；顶点法线由它参与的所有三角形面法线按**折痕角阈值**平均：
+      与某三角形法线夹角 <= CREASE_ANGLE_DEG 的邻面参与平均，> 阈值的不参与。
+      于是圆柱/球面/圆孔变光滑，方块的棱和倒角的边仍然锐利。
+    - 法线平均用**面积加权**：mesh 是曲面离散，三角形面积即该处曲面面积的采样，
+      面积加权才能逼近真实曲面的法线（等权重会被小三角形拉偏，在曲率突变处产生可见条纹）。
 """
 
 import argparse
@@ -32,9 +41,13 @@ import time
 import traceback
 
 MAX_TRIANGLES = 300000      # 三角形上限默认值（可用 --max-triangles 覆盖）：超过先加大挠度重试一次，仍超则截断
+                            # 实测新精度（0.08mm/0.12rad）下 6 个真实零件只有 2004~3500 个三角形，
+                            # 离这里 90 倍余量，重试分支实际不会触发；故不下调也不上调，保持
+                            # 与 lib/resolve.js 的 DEFAULT_MAX_TRIANGLES、客户端 mid 档一致。
 MAX_EDGE_POINTS = 400000    # 边折线总点数上限：超过整体步长降采样
-DEFAULT_DEFLECTION = 0.2
-ANGULAR_DEFLECTION = 0.5    # 弧度
+DEFAULT_DEFLECTION = 0.08   # mm：弦高误差。0.2 时 φ50 圆的侧壁只用 13 段，轮廓明显有棱
+ANGULAR_DEFLECTION = 0.12   # 弧度（≈6.9°）：φ50 圆切成约 52 段；0.5 弧度只有约 13 段
+CREASE_ANGLE_DEG = 35.0     # 折痕角阈值：相邻三角形法线夹角 <= 它才平滑平均，> 它保留锐边
 
 S3DM_VERSION = 2            # v2：新增可选 faceEdge buffer + faceEdgeCount/maxTriangles 头字段
 
@@ -227,15 +240,19 @@ def shape_bbox(shape):
     return bbox, center
 
 
-def triangulate(shape, deflection, clean=False):
-    """就地三角化。clean=True 先丢掉已有网格 —— BRepMesh 是增量的，否则加大挠度没效果。"""
+def triangulate(shape, deflection, clean=False, angular_deflection=None):
+    """就地三角化。clean=True 先丢掉已有网格 —— BRepMesh 是增量的，否则加大挠度没效果。
+
+    angular_deflection 是**弧度**的弦高以外夹角上限：同一段圆弧要切成多少片由它决定。
+    """
     if clean:
         try:
             BRepTools.Clean_s(shape, True)
         except Exception:
             pass
+    angular = ANGULAR_DEFLECTION if angular_deflection is None else angular_deflection
     try:
-        mesh = BRepMesh_IncrementalMesh(shape, deflection, False, ANGULAR_DEFLECTION, True)
+        mesh = BRepMesh_IncrementalMesh(shape, deflection, False, angular, True)
         return bool(mesh.IsDone())
     except Exception:
         return False
@@ -362,9 +379,145 @@ def edge_polyline(edge, curve, length, deflection):
     return points
 
 
+def position_key(point):
+    """焊接键：用**写入 buffer 的精度**（rnd(x, 5)）量化坐标。
+
+    必须和真正写进 position buffer 的值走同一个量化：否则键看起来相同、
+    buffer 里却是两个略不同的坐标，客户端那边仍然是两套顶点。
+    """
+    return (rnd(point[0], 5), rnd(point[1], 5), rnd(point[2], 5))
+
+
+def weld_and_smooth(corners, tri_normals, tri_areas, crease_angle_deg):
+    """按位置焊接顶点，并按折痕角阈值计算平滑顶点法线。
+
+    corners:     [(keyA, keyB, keyC), ...] 每个三角形的三个**位置键**
+    tri_normals: [(nx, ny, nz), ...]      每个三角形自己的单位面法线
+    tri_areas:   [area, ...]              每个三角形面积（面积加权用）
+
+    返回 (positions, normals, indices) 三个扁平列表，可直接进 S3DM buffer。
+    顺序稳定：顶点按位置首次出现顺序发射，三角形严格按输入顺序发射
+    （faceOfTriangle 因此天然与三角形一一对应）。
+
+    折痕规则：一个顶点位置周围可能同时存在「侧面」和「端面」。把该位置参与的
+    三角形按**面法线夹角 <= 阈值**贪心聚类（大面积优先做种子），每个簇发射一个
+    顶点、法线 = 簇内按面积加权的面法线平均。于是同一位置的圆柱侧壁连成一个
+    顶点（光滑），而端面和侧壁因为夹角 90° > 35° 天然落进两个簇 —— 棱保持锐利。
+    """
+    threshold = math.cos(math.radians(max(0.0, min(179.0, crease_angle_deg))))
+
+    # 位置键 → 参与该位置的三角形列表（按面积降序，种子取最大的面，结果与输入顺序无关）
+    at_position = {}
+    order = []
+    for triangle_index, keys in enumerate(corners):
+        for key in keys:
+            bucket = at_position.get(key)
+            if bucket is None:
+                bucket = []
+                at_position[key] = bucket
+                order.append(key)
+            bucket.append(triangle_index)
+    for key in order:
+        at_position[key].sort(key=lambda t: (-tri_areas[t], t))
+
+    # (位置键, 三角形) → (该位置的簇序号)，以及 (位置键, 簇序号) → 最终顶点索引。
+    # 两张表分开：第一遍只做聚类，顶点索引等簇定下来再统一分配，避开「先写负号再解码」
+    # 这类容易写错的自欺编码。
+    cluster_of = {}
+    vertex_of = {}
+    vertex_keys = []
+    vertex_normals = []
+    for key in order:
+        members = at_position[key]
+        clusters = []       # [面积加权法线和（未归一化）]
+        for triangle_index in members:
+            normal = tri_normals[triangle_index]
+            if normal is None:
+                cluster_of[(key, triangle_index)] = None
+                continue
+            weight = tri_areas[triangle_index]
+            placed = -1
+            for cluster_index, total in enumerate(clusters):
+                # 与簇内**当前平均方向**的夹角 <= 折痕角才算同一个平滑区域
+                if _dot(total, normal) >= threshold * _length(total):
+                    placed = cluster_index
+                    break
+            if placed < 0:
+                placed = len(clusters)
+                clusters.append([normal[0] * weight, normal[1] * weight, normal[2] * weight])
+            else:
+                total = clusters[placed]
+                total[0] += normal[0] * weight
+                total[1] += normal[1] * weight
+                total[2] += normal[2] * weight
+            cluster_of[(key, triangle_index)] = placed
+
+        if not clusters:
+            # 该位置参与的三角形全是退化面（叉积为零）：发射一个零法线顶点。
+            vertex_of[(key, -1)] = len(vertex_keys)
+            vertex_keys.append(key)
+            vertex_normals.append((0.0, 0.0, 0.0))
+            for triangle_index in members:
+                cluster_of[(key, triangle_index)] = -1
+            continue
+        for cluster_index, total in enumerate(clusters):
+            vertex_of[(key, cluster_index)] = len(vertex_keys)
+            vertex_keys.append(key)
+            vertex_normals.append(_unit(total))
+
+    triangles = []
+    for triangle_index, keys in enumerate(corners):
+        emitted = []
+        usable = True
+        for key in keys:
+            slot = cluster_of.get((key, triangle_index))
+            index = None if slot is None else vertex_of.get((key, slot))
+            if index is None:
+                usable = False
+                break
+            emitted.append(index)
+        if not usable:
+            # 防御：三角形绝不能丢（faceOfTriangle 必须一一对应）。退化或缺失时
+            # 退回「该三角形单独一套顶点 + 它自己的面法线」的保守路径。
+            normal = _unit(tri_normals[triangle_index] or (0.0, 0.0, 0.0))
+            emitted = []
+            for key in keys:
+                emitted.append(len(vertex_keys))
+                vertex_keys.append(key)
+                vertex_normals.append(normal)
+        triangles.append((emitted[0], emitted[1], emitted[2]))
+
+    positions = []
+    for key in vertex_keys:
+        positions.extend(key)
+    flat_normals = []
+    for normal in vertex_normals:
+        flat_normals.extend((rnd(normal[0], 5), rnd(normal[1], 5), rnd(normal[2], 5)))
+    flat_indices = []
+    for emitted in triangles:
+        flat_indices.extend(emitted)
+    return positions, flat_normals, flat_indices
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _length(a):
+    return math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])
+
+
+def _unit(a):
+    length = _length(a)
+    if length <= 1e-12:
+        return (0.0, 0.0, 0.0)
+    return (a[0] / length, a[1] / length, a[2] / length)
+
+
 # --------------------------------------------------------------------------- 主流程
 
-def build_mesh(in_path, out_path, deflection, source_path=None, max_triangles=None):
+def build_mesh(in_path, out_path, deflection, source_path=None, max_triangles=None,
+               crease_angle=None, angular_deflection=None):
     started = time.time()
     if not HAVE_OCP:
         raise MeshError("OCP_MISSING", "缺少 OCP（OCCT python 绑定）：%s" % OCP_ERROR, 3)
@@ -377,6 +530,23 @@ def build_mesh(in_path, out_path, deflection, source_path=None, max_triangles=No
         triangle_limit = MAX_TRIANGLES
     triangle_limit = max(2000, min(5000000, triangle_limit))
 
+    try:
+        crease_deg = float(crease_angle) if crease_angle is not None else CREASE_ANGLE_DEG
+    except Exception:
+        crease_deg = CREASE_ANGLE_DEG
+    if not math.isfinite(crease_deg):
+        crease_deg = CREASE_ANGLE_DEG
+    # 0° = 等价于原来的平面着色（每个三角形一个顶点集合）；180° = 全平滑（会磨圆所有棱）。
+    crease_deg = max(0.0, min(180.0, crease_deg))
+
+    try:
+        angular = float(angular_deflection) if angular_deflection else ANGULAR_DEFLECTION
+    except Exception:
+        angular = ANGULAR_DEFLECTION
+    if not math.isfinite(angular) or angular <= 0.0:
+        angular = ANGULAR_DEFLECTION
+    angular = max(0.01, min(math.pi, angular))
+
     use_mm_units()
     shape = read_step(in_path)
     bbox, center = shape_bbox(shape)
@@ -386,20 +556,28 @@ def build_mesh(in_path, out_path, deflection, source_path=None, max_triangles=No
     truncated_edges = False
     retried = False
 
-    triangulate(shape, deflection)
+    triangulate(shape, deflection, angular_deflection=angular)
     triangle_total = count_triangles(shape)
     effective_deflection = deflection
+    effective_angular = angular
     if triangle_total > triangle_limit:
-        retry_deflection = min(50.0, deflection * math.sqrt(triangle_total / float(triangle_limit)) * 1.05)
-        if triangulate(shape, retry_deflection, clean=True):
+        # 细分同时受「弦高挠度」和「角向挠度」约束：圆柱这类曲面几乎完全由角向决定，
+        # 所以重试必须**两个一起放大**，只放大弦高会一点效果都没有（实测 φ50 圆柱
+        # 0.2mm/0.5rad=140 片、0.2mm/0.12rad=416 片，光调弦高压不下来）。
+        scale = math.sqrt(triangle_total / float(triangle_limit)) * 1.05
+        retry_deflection = min(50.0, deflection * scale)
+        retry_angular = min(math.pi, angular * scale)
+        if triangulate(shape, retry_deflection, clean=True, angular_deflection=retry_angular):
             retried_total = count_triangles(shape)
             if retried_total < triangle_total:
                 effective_deflection = retry_deflection
+                effective_angular = retry_angular
                 triangle_total = retried_total
                 retried = True
                 warnings.append(
-                    "三角形数 %d 超过上限 %d，挠度从 %.4f 放大到 %.4f 后重算"
-                    % (triangle_total, triangle_limit, deflection, effective_deflection)
+                    "三角形数 %d 超过上限 %d，挠度 %.4f→%.4f mm、角向 %.4f→%.4f rad 后重算"
+                    % (triangle_total, triangle_limit, deflection, effective_deflection,
+                       angular, effective_angular)
                 )
 
     ShapeMap, EdgeFacesMap = shape_map_types()
@@ -410,9 +588,11 @@ def build_mesh(in_path, out_path, deflection, source_path=None, max_triangles=No
     edge_faces = EdgeFacesMap()
     TopExp.MapShapesAndAncestors_s(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces)
 
-    positions = []
-    normals = []
-    indices = []
+    # 先收集三角形（位置键 + 面法线 + 面积），再统一焊接 + 平滑法线。
+    # 直接按三角形展平写顶点是「顶点不共享 + 面法线」= 纯平面着色，曲面会有明显面片感。
+    corners = []                 # [(keyA, keyB, keyC)]
+    triangle_normals = []        # 每个三角形自己的单位面法线
+    triangle_areas = []          # 每个三角形的面积（面积加权）
     face_of_triangle = []
     faces = []
     flip_votes = 0.0
@@ -439,7 +619,7 @@ def build_mesh(in_path, out_path, deflection, source_path=None, max_triangles=No
         if node_count <= 0 or triangle_count <= 0:
             faces.append(entry)
             continue
-        if len(indices) // 3 >= triangle_limit:
+        if len(face_of_triangle) >= triangle_limit:
             truncated_triangles = True
             faces.append(entry)
             continue
@@ -456,7 +636,7 @@ def build_mesh(in_path, out_path, deflection, source_path=None, max_triangles=No
         accumulated = [0.0, 0.0, 0.0]
         local_area = 0.0
         for triangle_index in range(1, triangle_count + 1):
-            if len(indices) // 3 >= triangle_limit:
+            if len(face_of_triangle) >= triangle_limit:
                 truncated_triangles = True
                 break
             try:
@@ -472,16 +652,14 @@ def build_mesh(in_path, out_path, deflection, source_path=None, max_triangles=No
             if length > 1e-12:
                 unit = (cross[0] / length, cross[1] / length, cross[2] / length)
             else:
-                unit = (0.0, 0.0, 0.0)
+                unit = None
             accumulated[0] += cross[0]
             accumulated[1] += cross[1]
             accumulated[2] += cross[2]
             local_area += area
-            base = len(positions) // 3
-            for point in points:
-                positions.extend((rnd(point[0], 5), rnd(point[1], 5), rnd(point[2], 5)))
-                normals.extend((rnd(unit[0], 5), rnd(unit[1], 5), rnd(unit[2], 5)))
-            indices.extend((base, base + 1, base + 2))
+            corners.append(tuple(position_key(point) for point in points))
+            triangle_normals.append(unit)
+            triangle_areas.append(area)
             face_of_triangle.append(face_index)
 
         magnitude = math.sqrt(accumulated[0] ** 2 + accumulated[1] ** 2 + accumulated[2] ** 2)
@@ -506,7 +684,14 @@ def build_mesh(in_path, out_path, deflection, source_path=None, max_triangles=No
             )
         faces.append(entry)
 
+    # 焊接顶点 + 按折痕角平滑法线（面积加权平均）
+    vertices_before = len(corners) * 3
+    positions, normals, indices = weld_and_smooth(
+        corners, triangle_normals, triangle_areas, crease_deg
+    )
+
     # 整块实体的朝向自检：面积加权点积为负说明所有面都朝内，统一翻面。
+    # 焊接后每个顶点只有一条法线，取反仍然正确；顶点索引不变，只换 winding。
     if flip_votes < 0.0:
         warnings.append("面法向整体朝内（面积加权点积为负），已统一翻转")
         for index in range(0, len(normals), 3):
@@ -665,7 +850,14 @@ def build_mesh(in_path, out_path, deflection, source_path=None, max_triangles=No
         "edges": edges,
         "warnings": warnings,
         "deflectionMm": rnd(effective_deflection, 4),
+        "angularDeflectionRad": rnd(effective_angular, 5),
         "maxTriangles": triangle_limit,
+        "creaseAngleDeg": rnd(crease_deg, 2),
+        "welded": {
+            "verticesBefore": vertices_before,
+            "verticesAfter": vertex_count,
+            "ratio": rnd(vertex_count / float(vertices_before), 4) if vertices_before else 0.0,
+        },
         "precision": {
             "deflectionMm": rnd(effective_deflection, 4),
             "maxTriangles": triangle_limit,
@@ -727,6 +919,13 @@ def build_mesh(in_path, out_path, deflection, source_path=None, max_triangles=No
         "edgePointCount": len(edge_positions) // 3,
         "truncated": {"triangles": truncated_triangles, "edges": truncated_edges},
         "deflectionMm": rnd(effective_deflection, 4),
+        "angularDeflectionRad": rnd(effective_angular, 5),
+        "creaseAngleDeg": rnd(crease_deg, 2),
+        "welded": {
+            "verticesBefore": vertices_before,
+            "verticesAfter": vertex_count,
+            "ratio": rnd(vertex_count / float(vertices_before), 4) if vertices_before else 0.0,
+        },
         "maxTriangles": triangle_limit,
         "retried": retried,
         "warnings": warnings,
@@ -739,13 +938,18 @@ def main(argv=None):
     parser.add_argument("--out", dest="output", required=True, help="输出 S3DM 路径")
     parser.add_argument("--deflection", dest="deflection", type=float, default=DEFAULT_DEFLECTION)
     parser.add_argument("--max-triangles", dest="max_triangles", type=int, default=MAX_TRIANGLES,
-                        help="三角形上限（精度档）；超出会先加大挠度重算，仍超则截断")
+                        help="三角形上限（精度档）；超出会先同时加大弦高/角向挠度重算，仍超则截断")
+    parser.add_argument("--crease-angle", dest="crease_angle", type=float, default=CREASE_ANGLE_DEG,
+                        help="折痕角阈值（度）：相邻面法线夹角 <= 它才平滑平均；0=纯平面着色，180=全平滑")
+    parser.add_argument("--angular-deflection", dest="angular_deflection", type=float, default=ANGULAR_DEFLECTION,
+                        help="角向挠度（弧度），越小圆弧切得越细")
     parser.add_argument("--source-path", dest="source_path", default=None, help="写进 header.source.path 的原始路径")
     args = parser.parse_args(argv)
 
     deflection = args.deflection if args.deflection and args.deflection > 0 else DEFAULT_DEFLECTION
     try:
-        summary = build_mesh(args.input, args.output, deflection, args.source_path, args.max_triangles)
+        summary = build_mesh(args.input, args.output, deflection, args.source_path, args.max_triangles,
+                             args.crease_angle, args.angular_deflection)
     except MeshError as error:
         print(str(error), file=sys.stderr)
         print(json.dumps({"ok": False, "code": error.code, "message": str(error)}, ensure_ascii=False), flush=True)

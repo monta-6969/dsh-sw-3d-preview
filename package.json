@@ -1,8 +1,23 @@
 {
-  "name": "@local/dsh-sw-3d-preview",
-  "version": "0.2.0",
-  "private": true,
+  "name": "dsh-sw-3d-preview",
+  "version": "0.2.2",
+  "license": "MIT",
+  "author": "dsh-sw-3d-preview contributors",
+  "repository": { "type": "git", "url": "git+https://github.com/monta-6969/dsh-sw-3d-preview.git" },
+  "homepage": "https://github.com/monta-6969/dsh-sw-3d-preview#readme",
+  "bugs": { "url": "https://github.com/monta-6969/dsh-sw-3d-preview/issues" },
   "description": "在文件预览面板里查看 3D 成果：STEP/STL/OBJ → S3DM v2 网格，支持面/边拾取、三点法标注、剖切封盖与标注交接单",
+  "icon": "./icon.svg",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "solidworks",
+    "step",
+    "stl",
+    "3d-preview",
+    "cad"
+  ],
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -15,10 +30,25 @@
     "client.js",
     "cordis.patch.yml",
     "lib",
-    "vendor"
+    "vendor/three.cjs",
+    "icon.svg",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "dsh": ">=0.2.1-rc.3 <0.3.0-0"
+  },
+  "scripts": {
+    "test": "node test/host.mjs && node test/package.mjs && node test/python-candidates.mjs && node test/client-smoke.mjs && node test/sketch-select.mjs && node test/sketch-only.mjs && node test/ext-token.mjs",
+    "test:host": "node test/host.mjs",
+    "test:ext-token": "node test/ext-token.mjs",
+    "test:python": "node test/python-candidates.mjs",
+    "test:client": "node test/client-smoke.mjs",
+    "test:package": "node test/package.mjs",
+    "package": "node scripts/package.mjs",
+    "verify:python": "node -e \"import('./lib/mesh.js').then(async m => { const r = await m.probePython(); console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); })\""
   },
   "dsh": {
     "manifestVersion": 1,

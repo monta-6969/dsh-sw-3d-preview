@@ -1,0 +1,158 @@
+name: Bug report
+description: 报告 dsh-sw-3d-preview 的可复现缺陷（不是功能请求，不是已知限制）
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 先看这三件事
+
+        1. **README 第 6 节「已知限制」是一份长清单**（视觉未验证、草图端点只认折线顶点、圆弧长度偏小、
+           草图视图不能做实体拾取、`sketch-only` 的测试缺陷……）。你的问题很可能在里面。
+        2. **所有自动化视觉测试都是假渲染器**：`test/sketch-select.mjs` 的 `HeadlessRenderer.getContext()`
+           **返回 `null`**、`render()` 是空函数。也就是说测试**从不产出一个像素**。
+           所以「看起来不对」这类问题，**必须在真浏览器里复现**并说明，否则无法区分是渲染 bug 还是没人看过。
+        3. 本项目是 `UNLICENSED` 的内部插件，不是所有环境组合都被支持过（见下面的 OS / 版本字段）。
+
+  - type: input
+    id: dsh-version
+    attributes:
+      label: DSH 版本
+      description: 输出 `dsh --version` 的结果。插件要求 `>= 0.2.1-rc.3 < 0.3.0-0`（见 package.json 的 engines.dsh）。
+      placeholder: "例如 0.2.2-rc.3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      description: 本插件目前是 Windows-only 设计（内部路径语义只认盘符/UNC，见 lib/paths.js 的 isAbsoluteFsPath）。
+      options:
+        - Windows 11
+        - Windows 10
+        - Windows Server
+        - Linux（非支持环境，仅供记录）
+        - macOS（非支持环境，仅供记录）
+        - 其它（在「补充信息」里写）
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: 插件版本
+      description: package.json 里的 version，或你拿到的分发包名。当前主线是 0.2.2。
+      placeholder: "例如 0.2.2"
+    validations:
+      required: true
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node 版本
+      description: 输出 `node --version`。插件要求 >= 22；跑测试与宿主用同一个版本最省事。
+      placeholder: "例如 v24.21.0"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: file-format
+    attributes:
+      label: 出问题的文件格式
+      description: 不同格式走的是完全不同的代码路径，选最能代表问题的那一个。
+      options:
+        - STEP（.step / .stp）
+        - STL（.stl）
+        - OBJ（.obj）
+        - SolidWorks 原生件（.sldprt / .sldasm，靠同名 STEP 或草图视图降级）
+        - 与具体格式无关（路由/UI/标注都出问题）
+    validations:
+      required: true
+
+  - type: dropdown
+    id: python-ocp
+    attributes:
+      label: 本机 Python 与 cadquery-ocp 状态
+      description: |
+        STEP 三角化必须走 Python 子进程（`lib/step_mesh.py`，依赖 OCP）。请先跑 `npm run verify:python`
+        并选它告诉你的结论；不确定就选最后一项。
+      options:
+        - 装了 Python，且 `npm run verify:python` 报 ok=true / ocp=true
+        - 装了 Python，但 OCP 导入失败（ok=false 或 ocp=false）
+        - 没装 Python（此时 STEP/SLDPRT 必然失败，只有 STL/OBJ 能走内置解析）
+        - 没查过 / 不确定
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reproduced-real-browser
+    attributes:
+      label: 是否在真浏览器里复现过？（重要）
+      description: |
+        **这条特别重要。** 本仓库所有自动化测试用的是假渲染器（`getContext()` 返回 `null`、`render()` 为空），
+        从不产出像素。任何与「看到的画面」有关的问题，只有真浏览器复现才算证据。
+        如果问题不涉及画面（例如路由返回码、标注文件内容），选「不涉及画面」。
+      options:
+        - 是，在真浏览器里看到了（并已在下方填了浏览器信息）
+        - 是，在真浏览器里复现过，但问题不涉及画面（路由/数据/文件）
+        - 否，只跑过自动化测试，没在真浏览器里看过
+        - 不涉及画面（纯后端/路由/文件问题）
+    validations:
+      required: true
+
+  - type: input
+    id: browser
+    attributes:
+      label: 浏览器 / 渲染环境（若涉及画面）
+      description: 浏览器名与版本、以及是否开了硬件加速。若是 DSH Desktop 内嵌窗口，写「DSH Desktop 内嵌」。
+      placeholder: "例如 Chrome 141 / DSH Desktop 内嵌 WebView2"
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 按顺序写，能照着走。包含文件是怎么打开的（预览面板 / 直接请求 /sw3d/*）。
+      placeholder: |
+        1. 打开 DSH，预览 ...
+        2. 在面板里 Ctrl+点 ...
+        3. 期望 ...，实际 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-actual
+    attributes:
+      label: 期望行为 / 实际行为
+      description: 分两段写。实际行为尽量附上可核对的数字或文字（返回码、info 条文字、文件内容片段）。
+      placeholder: |
+        期望：...
+        实际：...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 错误日志 / 输出
+      description: |
+        DSH 日志里 `[sw-3d-preview]` 前缀的堆栈、`/sw3d/ping` 的返回、或跑测试的输出尾部。
+        大段日志请截关键部分，不要贴全量。**贴之前删掉本机绝对路径与个人信息。**
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已确认这不是 README 第 6 节「已知限制」里已经写明的条目（或我说明了为什么它不同）。
+          required: true
+        - label: 我已在本机实际复现过，不是仅凭推测（若为推测，我已在上面标明「未验证」）。
+          required: true
+        - label: 我已从日志/截图里删除了本机绝对路径、用户名等敏感信息。
+          required: true

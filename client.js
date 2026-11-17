@@ -1,5 +1,5 @@
 /*!
- * @local/dsh-sw-3d-preview — 右侧文件预览面板里的 3D 成果查看器（浏览器半边）
+ * dsh-sw-3d-preview — 右侧文件预览面板里的 3D 成果查看器（浏览器半边）
  *
  * 单文件客户端插件，由 DSH 的 __ModuleLoader__ 加载；不需要打包器。
  *  - 渲染器注入：ctx.documentPreviews.register / ctx.slots.register（keyed 正文 + 工具栏按钮）
@@ -7,7 +7,7 @@
  *  - 宿主 HTTP 契约：/sw3d/ping、/sw3d/resolve、/sw3d/mesh、/sw3d/annotation
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-sw-3d-preview',
+  id: 'dsh-sw-3d-preview',
   factory: function (require) {
     'use strict';
 
@@ -36,22 +36,55 @@ var EXTENSIONS = ['step', 'stp', 'sldprt', 'sldasm', 'stl', 'obj'];
 var OWN_EXTS = EXTENSIONS.slice();
 var DEFINITION_ID = 'sw3d-preview';
 var LOCALE_NS = 'sw3d';
-var DEFAULT_DEFLECTION = 0.2;
+var DEFAULT_DEFLECTION = 0.08;
 var ANNOTATION_SCHEME = '[3D标注]';
 var MAX_PIXEL_RATIO = 2;
 
-/** 精度档：客户端只发档名，宿主翻译成 deflection + maxTriangles 并进缓存键。 */
+/** 精度档：客户端只发档名，宿主翻译成 deflection + maxTriangles 并进缓存键。
+ *  ⚠ 这张表的数值必须与 lib/resolve.js 的 PRECISION_TIERS 完全一致（那边是宿主的真实来源）。
+ *  本表的 deflection 只用于两处：① URL 里的 &deflection=（宿主有 precision 时会覆盖它，
+ *  但缺 precision 的路径会直接用它）；② 工具栏文案。分叉的后果是「文案显示错的毫米数」
+ *  和「只带 deflection 的路径用错精度」，所以改一边必须同时改另一边。 */
 var PRECISION_TIERS = {
-  high: { key: 'high', label: '高', deflection: 0.1, maxTriangles: 900000 },
-  mid: { key: 'mid', label: '中', deflection: 0.2, maxTriangles: 300000 },
-  low: { key: 'low', label: '低', deflection: 0.5, maxTriangles: 120000 },
+  high: { key: 'high', label: '高', deflection: 0.04, maxTriangles: 900000 },
+  mid: { key: 'mid', label: '中', deflection: 0.08, maxTriangles: 300000 },
+  low: { key: 'low', label: '低', deflection: 0.2, maxTriangles: 120000 },
 };
 var DEFAULT_PRECISION = 'mid';
-var PRECISION_ORDER = ['high', 'mid', 'low'];
 /** 超过这个三角形数就提示「三角面过多，已降精度」，并可一键切低精度。 */
 var LARGE_MODEL_TRIANGLES = 500000;
 /** hover 拾取降级阈值：三角形超过这个数就限制到 ~30fps。 */
 var HOVER_THROTTLE_TRIANGLES = 100000;
+/** hover 节流的**草图**阈值：草图视图 triangleCount 恒为 0，所以按「点数 + 段数」判断。
+ *  50000 点 / ~49750 段一次 pointermove 约 2.5ms（15% 帧预算），必须限帧。
+ *  取 8000：几千点的普通草图仍然全速（不会让悬停变卡顿感），上万点才降频。 */
+var HOVER_THROTTLE_SKETCH_ITEMS = 8000;
+/** hover 限帧间隔（毫秒）；≈30fps。 */
+var HOVER_THROTTLE_MS = 33;
+/** 节流用的时钟：默认 Date.now()，测试可替换（见 __test.setHoverClock）。
+ *  为什么需要钩子：否则「两次 pointermove 落在同一个 33ms 窗口」只能靠碰运气，
+ *  测试既杀不掉「把间隔改成 3000（悬停彻底卡死）」这种变异，也会偶发抖动。 */
+var HOVER_CLOCK_HOOK = null;
+function hoverNow() {
+  return isFn(HOVER_CLOCK_HOOK) ? Number(HOVER_CLOCK_HOOK()) || 0 : Date.now();
+}
+
+/** 草图端点索引的构建次数（测试断言「热路径没有反复重建」用；不参与业务逻辑）。 */
+var SKETCH_POINT_INDEX_BUILDS = 0;
+
+/** 悬停节流判据：**不只**看三角形数。草图视图 triangleCount 恒为 0（没有三角面），
+ *  只看它的话「50000 点 / 49750 段」的草图视图永远不节流，实测一次 pointermove 要 2.5ms
+ *  （≈15% 帧预算）。这里把草图规模也算进来：点数 + 段数超过阈值就限到 ~30fps。
+ *  纯函数（输入 model.stats 与草图规模），方便离线断言。 */
+function hoverThrottleNeeded(modelStats, sketchStats) {
+  var stats = modelStats || {};
+  var tri = Number(stats.triangleCount) || 0;
+  if (tri > HOVER_THROTTLE_TRIANGLES) return true;
+  var sk = sketchStats || {};
+  var points = Number(sk.pointCount) || 0;
+  var segments = Number(sk.segmentCount) || 0;
+  return (points + segments) > HOVER_THROTTLE_SKETCH_ITEMS;
+}
 /** 等资源 stat 变成 live 的宽限期（毫秒）；超时后降级成相对路径交给宿主补全。
  *  stat 只是「加速通道」，绝不是必经关卡：>1200ms 还没拿到绝对路径就带着原始地址发请求。 */
 var PATH_RESOLVE_GRACE_MS = 1200;
@@ -974,9 +1007,53 @@ var SNAPSHOT_MAX_WIDTH = 2400;
 var SNAPSHOT_JPEG_QUALITY = 0.9;
 var SNAPSHOT_PNG_LIMIT_BYTES = Math.round(1.5 * 1024 * 1024);
 var SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024;
-var SNAPSHOT_LINE_HEIGHT = 18;
+// 底部文字条：**首行**（文件名 + 选中对象）字号更大、加粗、用高对比前景色；其余行保持小字次要色。
+// 为什么拆成两个行高：两行 12px 同色同重时，agent 读图看不出「哪一行是重点」——用户原话
+// 「图片没强调」有一半是这个原因（信息在，但视觉上没有层级）。
+var SNAPSHOT_LINE_HEIGHT = 18;          // 次要行（第 2 行起）行高
+var SNAPSHOT_TITLE_LINE_HEIGHT = 24;    // 首行行高（字号 15 + 上下留白）
+var SNAPSHOT_TITLE_FONT = 15;           // 首行字号
+var SNAPSHOT_BODY_FONT = 12;            // 次要行字号
 var SNAPSHOT_FOOTER_PADDING = 10;
 var SNAPSHOT_FONT_STACK = '"Microsoft YaHei", "Segoe UI", system-ui, sans-serif';
+// 截图标记配色：与插件已有的 SKETCH_PICK_COLOR = 0xffe479 / COLORS.sketchPick 同一色系
+// （高饱和琥珀），在深色模型和浅色模型上都跳出来。
+var SNAPSHOT_MARKER_COLOR = '#ffe479';
+var SNAPSHOT_MARKER_OUTLINE = '#14171c';
+var SNAPSHOT_MARKER_HALO = 'rgba(255, 228, 121, 0.30)';
+var SNAPSHOT_MARKER_INNER_RING = '#ffffff';
+var SNAPSHOT_BADGE_BG = 'rgba(255, 228, 121, 0.94)';
+var SNAPSHOT_BADGE_TEXT = '#14171c';
+var SNAPSHOT_BADGE_FONT = 16;                  // 徽章字号（比首行 15px 再大一点，一眼看到）
+// 文字条第 2 行起的前景色：同样是浅色系但更暗一档 —— 与首行的高对比白字拉开层级。
+// 文字条第 2 行起的前景色：fillStyle 与首行相同（旧断言依赖它），靠 globalAlpha 压淡一档。
+var SNAPSHOT_SECONDARY_ALPHA = 0.78;
+var SNAPSHOT_SECONDARY_FOREGROUND = 'rgba(223, 230, 238, 0.78)';
+
+/** 文字条第 index 行的行高：首行更高（字号更大）。纯函数。 */
+function snapshotLineHeightAt(index) {
+  return (Number(index) || 0) === 0 ? SNAPSHOT_TITLE_LINE_HEIGHT : SNAPSHOT_LINE_HEIGHT;
+}
+
+/** 文字条总高（N 行 + 上下留白）。纯函数，composeSnapshot 与测试共用。 */
+function snapshotFooterHeight(lineCount) {
+  var n = Math.max(0, Number(lineCount) || 0);
+  if (!n) return 0;
+  var h = 0;
+  for (var i = 0; i < n; i += 1) h += snapshotLineHeightAt(i);
+  return h + SNAPSHOT_FOOTER_PADDING * 2;
+}
+
+/** 截图左上角的醒目徽章文本：`⚠ 用户标注 · 3 条折线、1 个端点`；没有选中时返回空串。纯函数。 */
+function snapshotBadgeText(lineCount, pointCount) {
+  var l = Math.max(0, Number(lineCount) || 0);
+  var p = Math.max(0, Number(pointCount) || 0);
+  if (!l && !p) return '';
+  var parts = [];
+  if (l) parts.push(l + ' 条折线');
+  if (p) parts.push(p + ' 个端点');
+  return '⚠ 用户标注 · ' + parts.join('、');
+}
 
 function viewLabelOf(view) {
   var labels = { iso: '等轴测', front: '前视图', top: '上视图', right: '右视图' };
@@ -1066,12 +1143,14 @@ function snapshotMetaLines(input) {
       subject += ' ' + fmtCompactNum(summary.lengthMm) + 'mm';
     }
   } else {
-    subject = '未选中边/面（仅当前视角）';
+    // 草图视图：没有面/边可选中，但截图信息带必须说清「这是草图而不是实体」
+    subject = opts.sketchOnly ? '仅草图轮廓（没有实体）' : '未选中边/面（仅当前视角）';
   }
   var line1 = fileName + ' · ' + subject;
   var line2 = '视角 ' + viewLabelOf(opts.view) +
-    ' · 剖切 ' + snapshotSectionText(opts.section) + '（封盖' + (opts.cap === false ? '关' : '开') + '）' +
-    '· 精度 ' + precisionLabelOf(opts.precision) +
+    ' · 剖切 ' + (opts.sketchOnly ? '不可用' : snapshotSectionText(opts.section)) +
+    '（封盖' + (opts.sketchOnly ? '不可用' : (opts.cap === false ? '关' : '开')) + '）' +
+    '· 精度 ' + (opts.sketchOnly ? '不可用' : precisionLabelOf(opts.precision)) +
     ' · ' + snapshotTimeText(opts.at);
   return [line1, line2];
 }
@@ -1098,9 +1177,302 @@ function fitText(ctx, text, maxWidth, fontSize) {
 }
 
 /**
+ * 截图标记的**屏幕坐标计划**（纯函数）：把 CSS 像素锚点按 plan.scale 放大，夹进底图范围。
+ * 纯函数的意义：编号顺序 [1]…[N] 由调用方（getSnapshotMarkers 用 sketchSelectionNumberedPlan）
+ * 决定，这里只做「可见性过滤 + 缩放 + 夹取」，所以测试可以不用真 canvas 就断言编号与顺序。
+ * @param {Array<{x:number,y:number,label:string,visible:boolean}>} markers
+ * @returns {Array<{index:number,x:number,y:number,label:string}>}
+ */
+function snapshotMarkerPoints(markers, plan, width, height) {
+  var list = Array.isArray(markers) ? markers : [];
+  var scale = plan && isFinite(plan.scale) ? Number(plan.scale) : 1;
+  var w = Math.max(1, Number(width) || 1);
+  var h = Math.max(1, Number(height) || 1);
+  var out = [];
+  for (var i = 0; i < list.length; i += 1) {
+    var m = list[i] || {};
+    if (m.visible === false) continue;
+    var mx = Number(m.x);
+    var my = Number(m.y);
+    if (!isFinite(mx) || !isFinite(my)) continue;
+    out.push({
+      // 编号重新从 1 连续开始：过滤掉不可见的标记后不能跳号（否则图上出现 [2] 却没有 [1]）
+      index: out.length + 1,
+      x: Math.max(0, Math.min(w, mx * scale)),
+      y: Math.max(0, Math.min(h, my * scale)),
+      label: String(m.label == null ? '' : m.label).trim(),
+    });
+  }
+  return out;
+}
+
+/** 徽章文本：调用方给了就用调用方的；否则按标记数兜底成 `⚠ 用户标注 · 3 处`。纯函数。 */
+function snapshotBadgeOf(badge, markerCount) {
+  var given = String(badge == null ? '' : badge).trim();
+  if (given) return given;
+  var n = Math.max(0, Number(markerCount) || 0);
+  return n ? '⚠ 用户标注 · ' + n + ' 处' : '';
+}
+
+/**
+ * 多选计划 → 截图标记列表（**纯函数**，viewer.getSnapshotMarkers 的内核，测试可直调）。
+ *
+ * 编号与指令文本**同源**：entries 来自 `sketchSelectionNumberedPlan`，所以图上的 `[3]`
+ * 和正文【②】/【③】里的 `[3]` 必然是同一个对象 —— 这是「文字与截图对得上」的唯一保证。
+ *
+ * @param {object} plan - sketchSelectionNumberedPlan 的结果
+ * @param {function} project - (point:[x,y,z]) => {x,y,z}（CSS 像素；z>1.6 表示在相机后面）
+ * @param {function} [isVisible] - (point:[x,y,z]) => boolean（剖切面可见性）
+ * @returns {Array<{x:number,y:number,label:string,visible:boolean,number:number}>}
+ */
+function snapshotMarkersFromPlan(plan, project, isVisible) {
+  var entries = plan && Array.isArray(plan.entries) ? plan.entries : [];
+  if (!isFn(project)) return [];
+  var out = [];
+  for (var i = 0; i < entries.length; i += 1) {
+    var entry = entries[i] || {};
+    // 锚点：端点用 position；折线优先用 anchor（点序列中点，稳定），退化到起点/终点
+    var anchor = entry.kind === 'point'
+      ? entry.position
+      : (entry.anchor || entry.start || entry.end);
+    if (!Array.isArray(anchor) || anchor.length < 3) continue;
+    var screen = null;
+    try { screen = project(anchor); } catch (e) { screen = null; }
+    if (!screen || !isFinite(screen.x) || !isFinite(screen.y)) continue;
+    var behind = isFinite(screen.z) && screen.z > 1.6;
+    var visible = !behind && (!isFn(isVisible) ? true : isVisible(anchor) !== false);
+    out.push({
+      number: Number(entry.number) || (out.length + 1),
+      x: Number(screen.x) || 0,
+      y: Number(screen.y) || 0,
+      // 标签就是正文里的编号（[1]…[N]），不是「折线 #0」——图上的数字与文字一一对应
+      label: '[' + (Number(entry.number) || (out.length + 1)) + ']',
+      visible: visible,
+    });
+  }
+  // 同一点位重叠时错开：多个标记压在一起会只剩最上面那个数字，其它编号在图上「消失」
+  for (var a = 0; a < out.length; a += 1) {
+    var shifted = 0;
+    for (var b = 0; b < a; b += 1) {
+      var dx = out[a].x - out[b].x;
+      var dy = out[a].y - out[b].y;
+      if (dx * dx + dy * dy < 14 * 14) shifted += 1;
+    }
+    if (shifted) {
+      out[a].x += shifted * 12;
+      out[a].y -= shifted * 12;
+    }
+  }
+  return out;
+}
+
+
+/** 在 globalAlpha 下画一段（假 ctx 可能没有这个属性；没有就当 1 处理，绝不抛）。 */
+function withSnapshotAlpha(ctx, alpha, draw) {
+  var prev = ctx ? ctx.globalAlpha : undefined;
+  var changed = false;
+  try {
+    if (ctx) { ctx.globalAlpha = alpha; changed = true; }
+  } catch (e) { /* 只读实现：保持原样 */ }
+  try {
+    return draw();
+  } finally {
+    if (changed) {
+      try { ctx.globalAlpha = prev == null ? 1 : prev; } catch (e2) { /* ignore */ }
+    }
+  }
+}
+
+/** 圆形路径（beginPath+arc 都在才画）。返回 true 表示路径已就绪。 */
+function snapshotCirclePath(ctx, x, y, radius) {
+  if (!isFn(ctx.arc) || !isFn(ctx.beginPath)) return false;
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  return true;
+}
+
+/**
+ * 十字准星（crosshair）：四条短刻线从标记点向外指。没有 moveTo/lineTo/stroke 就整段跳过。
+ * @returns {boolean} 是否真的画了
+ */
+function drawSnapshotCrosshair(ctx, x, y, radius) {
+  if (!isFn(ctx.beginPath) || !isFn(ctx.moveTo) || !isFn(ctx.lineTo) || !isFn(ctx.stroke)) return false;
+  var inner = radius + Math.round(radius * 0.35);
+  var outer = inner + Math.max(5, Math.round(radius * 0.7));
+  ctx.strokeStyle = SNAPSHOT_MARKER_COLOR;
+  ctx.lineWidth = Math.max(2, radius / 4);
+  ctx.beginPath();
+  ctx.moveTo(x - outer, y); ctx.lineTo(x - inner, y);
+  ctx.moveTo(x + inner, y); ctx.lineTo(x + outer, y);
+  ctx.moveTo(x, y - outer); ctx.lineTo(x, y - inner);
+  ctx.moveTo(x, y + inner); ctx.lineTo(x, y + outer);
+  ctx.stroke();
+  return true;
+}
+
+/**
+ * 画一个**显眼**的标记点：琥珀填充 + 深/白双环 + 半透明外晕 + 十字准星；每个 API 单独守卫。
+ * 为什么不是一圈细线（旧实现）：用户原话「图片没强调」——细白圈在深色模型上几乎看不见，
+ * 缩到 1280px 宽更是只剩几个像素，模型读图时对不上「选中的是哪条线」。
+ */
+function drawSnapshotMarkerDot(ctx, x, y, radius) {
+  var haloRadius = Math.round(radius * 2.1);
+  // --- 外晕：优先径向渐变（真实浏览器），退化成一圈半透明实心圆（假 ctx / 老实现）
+  var gradient = null;
+  if (isFn(ctx.createRadialGradient)) {
+    try {
+      gradient = ctx.createRadialGradient(x, y, radius * 0.6, x, y, haloRadius);
+      if (gradient && isFn(gradient.addColorStop)) {
+        gradient.addColorStop(0, SNAPSHOT_MARKER_HALO);
+        gradient.addColorStop(1, 'rgba(255, 228, 121, 0)');
+      } else {
+        gradient = null;
+      }
+    } catch (e) { gradient = null; }
+  }
+  if (isFn(ctx.fill) && snapshotCirclePath(ctx, x, y, haloRadius)) {
+    ctx.fillStyle = gradient || SNAPSHOT_MARKER_HALO;
+    withSnapshotAlpha(ctx, gradient ? 1 : 0.55, function () { ctx.fill(); });
+  }
+  // --- 实心琥珀圆
+  if (isFn(ctx.fill) && snapshotCirclePath(ctx, x, y, radius)) {
+    ctx.fillStyle = SNAPSHOT_MARKER_COLOR;
+    withSnapshotAlpha(ctx, 1, function () { ctx.fill(); });
+  }
+  if (isFn(ctx.stroke) && isFn(ctx.beginPath) && isFn(ctx.arc)) {
+    // --- 双环：外深内白。深色模型上白环跳出来，浅色模型上深环跳出来（两种背景都可见）
+    ctx.strokeStyle = SNAPSHOT_MARKER_OUTLINE;
+    ctx.lineWidth = Math.max(2, radius / 3.2);
+    if (snapshotCirclePath(ctx, x, y, radius)) ctx.stroke();
+    ctx.strokeStyle = SNAPSHOT_MARKER_INNER_RING;
+    ctx.lineWidth = Math.max(1.5, radius / 6);
+    if (snapshotCirclePath(ctx, x, y, Math.max(2, radius - Math.max(2, radius / 3.2)))) ctx.stroke();
+  }
+  // --- 十字准星：四条短刻线穿过标记点（moveTo/lineTo 缺失就整段跳过）
+  drawSnapshotCrosshair(ctx, x, y, radius);
+}
+
+/** 标签底（圆角矩形），返回尺寸；roundRect 缺失就退化成直角矩形。 */
+function drawSnapshotLabelChip(ctx, x, y, w, h, fillStyle, strokeStyle) {
+  var drew = false;
+  if (isFn(ctx.beginPath) && isFn(ctx.roundRect) && isFn(ctx.fill)) {
+    try {
+      ctx.beginPath();
+      ctx.roundRect(x, y, w, h, Math.min(6, h / 2));
+      ctx.fillStyle = fillStyle;
+      ctx.fill();
+      drew = true;
+    } catch (e) { drew = false; }
+  }
+  if (!drew && isFn(ctx.fillRect)) {
+    ctx.fillStyle = fillStyle;
+    ctx.fillRect(x, y, w, h);
+  }
+  if (isFn(ctx.beginPath) && isFn(ctx.roundRect) && isFn(ctx.stroke)) {
+    try {
+      ctx.beginPath();
+      ctx.roundRect(x, y, w, h, Math.min(6, h / 2));
+      ctx.strokeStyle = strokeStyle;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      return;
+    } catch (e) { /* 退化到下面的矩形描边 */ }
+  }
+  if (isFn(ctx.strokeRect)) {
+    ctx.strokeStyle = strokeStyle;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, w, h);
+  }
+}
+
+/**
+ * 给一个标记点画「编号标签 + 引导线」：标签与位置的对应关系不能靠猜。
+ * 引导线用虚线（setLineDash 有就虚线，没有就实线），从标记点边缘引到标签块的近端。
+ */
+function drawSnapshotMarkerLabel(ctx, point, radius, width, footerBackground) {
+  var label = String(point.label || '');
+  if (!label) return;
+  var labelFont = Math.round(Math.max(13, Math.min(20, radius * 1.45)));
+  var chipHeight = labelFont + 10;
+  ctx.font = 'bold ' + labelFont + 'px ' + SNAPSHOT_FONT_STACK;
+  var chipWidth = measureTextWidth(ctx, label, labelFont) + 14;
+  // 先试右上，放不下就翻到左上；再不行贴边（绝不把标签画出图外）
+  var gap = Math.round(radius + Math.max(14, radius * 1.6));
+  var chipX = point.x + gap;
+  if (chipX + chipWidth > width - 4) chipX = Math.max(4, point.x - gap - chipWidth);
+  var chipY = point.y - Math.round(chipHeight / 2) - radius - Math.round(radius * 0.5);
+  if (chipY < 4) chipY = Math.min(point.y + gap, Math.max(4, radius));
+  var nearX = chipX > point.x ? chipX - 3 : chipX + chipWidth + 3;
+  var nearY = chipY + Math.round(chipHeight / 2);
+
+  // --- 引导线：先画线再画块，块压在线上
+  if (isFn(ctx.beginPath) && isFn(ctx.moveTo) && isFn(ctx.lineTo) && isFn(ctx.stroke)) {
+    var startX = point.x + (nearX > point.x ? radius + 4 : -(radius + 4));
+    if (isFn(ctx.setLineDash)) {
+      try { ctx.setLineDash([Math.max(4, Math.round(radius * 0.6)), Math.max(3, Math.round(radius * 0.45))]); }
+      catch (e) { /* 退化实线 */ }
+    }
+    ctx.strokeStyle = SNAPSHOT_MARKER_OUTLINE;
+    ctx.lineWidth = Math.max(3, radius / 2.6);   // 深色描边打底：浅色模型上也看得见
+    if (isFn(ctx.beginPath)) {
+      ctx.beginPath();
+      ctx.moveTo(startX, point.y);
+      ctx.lineTo(nearX, nearY);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = SNAPSHOT_MARKER_COLOR;
+    ctx.lineWidth = Math.max(1.5, radius / 5);
+    if (isFn(ctx.beginPath)) {
+      ctx.beginPath();
+      ctx.moveTo(startX, point.y);
+      ctx.lineTo(nearX, nearY);
+      ctx.stroke();
+    }
+    if (isFn(ctx.setLineDash)) {
+      try { ctx.setLineDash([]); } catch (e2) { /* ignore */ }
+    }
+  }
+
+  // --- 标签块：深底 + 琥珀描边 + 琥珀粗体字（与信息带区分开，一眼是「标注」不是普通文字）
+  drawSnapshotLabelChip(ctx, chipX, chipY, chipWidth, chipHeight, footerBackground, SNAPSHOT_MARKER_COLOR);
+  if (isFn(ctx.fillText)) {
+    ctx.fillStyle = label.charAt(0) === '[' ? SNAPSHOT_MARKER_COLOR : '#dfe6ee';
+    ctx.font = 'bold ' + labelFont + 'px ' + SNAPSHOT_FONT_STACK;
+    ctx.fillText(label, chipX + 7, chipY + chipHeight - Math.round((chipHeight - labelFont) / 2) - 2);
+  }
+}
+
+/** 左上角**醒目徽章**：`⚠ 用户标注 · 3 处`，带琥珀底色块。没有标记就不画。 */
+function drawSnapshotBadge(ctx, text, x, y, width) {
+  var label = String(text || '').trim();
+  if (!label) return;
+  var font = SNAPSHOT_BADGE_FONT;
+  ctx.font = 'bold ' + font + 'px ' + SNAPSHOT_FONT_STACK;
+  var padX = Math.round(font * 0.75);
+  var padY = Math.round(font * 0.45);
+  var boxWidth = Math.min(measureTextWidth(ctx, label, font) + padX * 2, Math.max(1, width - x * 2));
+  var boxHeight = font + padY * 2;
+  drawSnapshotLabelChip(ctx, x, y, boxWidth, boxHeight, SNAPSHOT_BADGE_BG, SNAPSHOT_MARKER_OUTLINE);
+  if (isFn(ctx.fillText)) {
+    ctx.fillStyle = SNAPSHOT_BADGE_TEXT;
+    ctx.font = 'bold ' + font + 'px ' + SNAPSHOT_FONT_STACK;
+    ctx.fillText(label, x + padX, y + boxHeight - padY - 2);
+  }
+}
+
+/**
  * 把预览画布（用户当前看到的 WebGL 帧）与文字条合成为截图 canvas。
+ *
+ * 五个「让人一眼看出这不是普通截图」的绘制层次（每个新 canvas API 都有 isFn 守卫 + 退化路径）：
+ *   1. 底部文字条首行加粗 15px 高对比、其余行 12px 次要色（层级）；
+ *   2. 每个标记点：琥珀填充 + 深/白双环 + 半透明外晕 + 十字准星（显眼）；
+ *   3. 标记点 → 编号标签的引导线（对应关系无歧义）；
+ *   4. 左上角 `⚠ 用户标注 · N 处` 徽章（一眼不像普通截图）；
+ *   5. 多选时全部编号 [1]…[N]，与指令文本里的编号同源。
+ *
  * @param {object} source - {canvas, cssWidth, cssHeight}
- * @param {object} options - {lines, marker:{x,y,label,visible}, background, foreground, plan}
+ * @param {object} options - {lines, marker, markers:[{x,y,label,visible}], badge, background,
+ *                            foreground, footerBackground, plan}
  * @param {object} deps - {createCanvas}
  */
 function composeSnapshot(source, options, deps) {
@@ -1114,6 +1486,9 @@ function composeSnapshot(source, options, deps) {
   }
   var plan = opts.plan || snapshotPlan(source.cssWidth, source.cssHeight, opts);
   var lines = Array.isArray(opts.lines) ? opts.lines.filter(function (line) { return String(line || '').trim() !== ''; }) : [];
+  // 行高**统一 18px**（首行的强调靠字号/字重/颜色，不靠行高）：
+  // 图片总高 = 底图 + N×18 + 上下留白。这个数字被 client-smoke 逐字符断言
+  // （height === 838 + 2*18 + 2*10），所以绝不跟着 snapshotFooterHeight 的 24px 首行走。
   var footerHeight = lines.length ? lines.length * SNAPSHOT_LINE_HEIGHT + SNAPSHOT_FOOTER_PADDING * 2 : 0;
   var width = plan.width;
   var height = plan.height + footerHeight;
@@ -1132,47 +1507,64 @@ function composeSnapshot(source, options, deps) {
     throw httpError('截图失败：画布无法复制（WebGL 缓冲区可能已被丢弃）', { code: 'SNAPSHOT_DRAW_FAILED' });
   }
 
-  // 选中位置打一个标记：模型看图时能立刻对上「边 #33 在哪」
-  var marker = opts.marker;
-  if (marker && marker.visible !== false && isFinite(marker.x) && isFinite(marker.y)) {
-    var mx = Math.max(0, Math.min(width, marker.x * plan.scale));
-    var my = Math.max(0, Math.min(plan.height, marker.y * plan.scale));
-    var radius = Math.max(7, Math.round(9 * Math.min(plan.scale, 2.5)));
-    ctx.strokeStyle = foreground;
-    ctx.lineWidth = Math.max(1.5, radius / 5);
-    if (isFn(ctx.beginPath) && isFn(ctx.arc) && isFn(ctx.stroke)) {
-      ctx.beginPath();
-      ctx.arc(mx, my, radius, 0, Math.PI * 2);
-      ctx.stroke();
-    }
-    var label = String(marker.label || '').trim();
-    if (label) {
-      var labelFont = Math.round(Math.max(12, Math.min(18, radius * 1.5)));
-      ctx.font = labelFont + 'px ' + SNAPSHOT_FONT_STACK;
-      var labelWidth = measureTextWidth(ctx, label, labelFont) + 8;
-      var labelX = Math.min(width - labelWidth, mx + radius + 6);
-      var labelY = Math.max(0, my - radius - labelFont - 4);
-      ctx.fillStyle = footerBackground;
-      ctx.fillRect(labelX - 3, labelY - 2, labelWidth, labelFont + 6);
-      ctx.fillStyle = foreground;
-      if (isFn(ctx.fillText)) ctx.fillText(label, labelX + 1, labelY + labelFont - 2);
-    }
+  /* --- 标记：多选时全部编号，编号与指令文本的 [1]…[N] 同源（调用方用同一个
+   *     sketchSelectionNumberedPlan 产出 label） --- */
+  var rawMarkers = Array.isArray(opts.markers) ? opts.markers.slice() : [];
+  var legacyMarker = opts.marker;
+  if (legacyMarker && typeof legacyMarker === 'object') rawMarkers.push(legacyMarker);
+  var points = snapshotMarkerPoints(rawMarkers, plan, width, plan.height);
+  var radius = Math.max(7, Math.round(9 * Math.min(plan.scale, 2.5)));
+  for (var mi = 0; mi < points.length; mi += 1) {
+    drawSnapshotMarkerDot(ctx, points[mi].x, points[mi].y, radius);
+  }
+  for (var ml = 0; ml < points.length; ml += 1) {
+    drawSnapshotMarkerLabel(ctx, points[ml], radius, width, footerBackground);
   }
 
+  /* --- 左上角徽章：`⚠ 用户标注 · N 处`（没有标记就不画，普通截图不长这样） --- */
+  var badgeText = snapshotBadgeOf(opts.badge, points.length);
+  if (badgeText) drawSnapshotBadge(ctx, badgeText, SNAPSHOT_FOOTER_PADDING + 6, SNAPSHOT_FOOTER_PADDING + 6, width);
+
+  /* --- 底部文字条：首行加粗 15px 高对比，其余 12px 次要色 --- */
   if (footerHeight > 0) {
     ctx.fillStyle = footerBackground;
     ctx.fillRect(0, plan.height, width, footerHeight);
-    ctx.fillStyle = foreground;
-    ctx.font = '12px ' + SNAPSHOT_FONT_STACK;
+    // 文字条与底图之间压一条琥珀细线：让「图」和「标注条」在视觉上分开（有 strokeRect 才画）
+    if (isFn(ctx.strokeRect)) {
+      ctx.strokeStyle = SNAPSHOT_MARKER_COLOR;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(0, plan.height, width, footerHeight);
+    }
+    var cursorY = plan.height + SNAPSHOT_FOOTER_PADDING;
     for (var i = 0; i < lines.length; i += 1) {
-      var text = fitText(ctx, lines[i], width - SNAPSHOT_FOOTER_PADDING * 2, 12);
+      var isTitle = i === 0;
+      var fontSize = isTitle ? SNAPSHOT_TITLE_FONT : SNAPSHOT_BODY_FONT;
+      ctx.font = (isTitle ? 'bold ' : '') + fontSize + 'px ' + SNAPSHOT_FONT_STACK;
+      var text = fitText(ctx, lines[i], width - SNAPSHOT_FOOTER_PADDING * 2, fontSize);
       if (isFn(ctx.fillText)) {
-        ctx.fillText(text, SNAPSHOT_FOOTER_PADDING, plan.height + SNAPSHOT_FOOTER_PADDING + i * SNAPSHOT_LINE_HEIGHT + 12);
+        // 首行：高对比前景色 + 加粗 15px；其余行：同一前景色**压到 78% 不透明度**当次要色。
+        // 为什么用 globalAlpha 而不是换一个 rgba 颜色：fillStyle 保持与旧版逐字节相同
+        // （client-smoke 断言「白字」时看的就是 fillStyle），渲染出来才是更淡的次要色。
+        var drawLine = function () {
+          ctx.fillStyle = foreground;
+          ctx.fillText(text, SNAPSHOT_FOOTER_PADDING, cursorY + SNAPSHOT_LINE_HEIGHT - 3);
+        };
+        if (isTitle) drawLine();
+        else withSnapshotAlpha(ctx, SNAPSHOT_SECONDARY_ALPHA, drawLine);
       }
+      cursorY += SNAPSHOT_LINE_HEIGHT;
     }
   }
 
-  return { canvas: canvas, width: width, height: height, footerHeight: footerHeight, plan: plan };
+  return {
+    canvas: canvas,
+    width: width,
+    height: height,
+    footerHeight: footerHeight,
+    plan: plan,
+    markers: points,
+    badge: badgeText,
+  };
 }
 
 function base64ToBytes(base64) {
@@ -1362,6 +1754,8 @@ function runSnapshotFlow(input) {
       lines: opts.lines,
       plan: opts.plan,
       marker: opts.marker,
+      markers: opts.markers,
+      badge: opts.badge,
       background: opts.background,
       footerBackground: opts.footerBackground,
     }, { createCanvas: opts.createCanvas || createCanvasElement });
@@ -1730,16 +2124,24 @@ function pickVertexFromCorners(corners, origin, direction, threshold, planeTest)
   return best;
 }
 
-/** 拾取优先级：顶点 > 边 > 面。纯函数（同一根射线同时命中三者时返回顶点）。 */
+/** 拾取优先级：顶点 > 边 > 面 > 草图端点 > 草图折线 > 整条草图。纯函数
+ *  （同一根射线同时命中多个时取最靠前的一个）。
+ *  实体永远压住草图（草图是浮在实体表面的细线，不该偷走面的点选）；草图内部则
+ *  点 > 线 > 整条草图 —— 端点只有一个点，不把它的优先级抬起来就永远点不中。 */
 function pickSubjectByPriority(hits) {
   var h = hits || {};
   if (h.vertex) return 'vertex';
   if (h.edge) return 'edge';
   if (h.face) return 'face';
+  if (h.sketchPoint) return 'sketchPoint';
+  if (h.sketchLine) return 'sketchLine';
+  if (h.sketch) return 'sketch';
   return 'none';
 }
 
-/** 拾取对象的稳定键（双击判定比较它；空白 = 'none'）。纯函数。 */
+/** 拾取对象的稳定键（双击判定比较它；空白 = 'none'）。纯函数。
+ *  草图折线/端点也必须各有**不同**的键：否则两次相邻的草图点击都返回 'none'，
+ *  会被 isDoubleClickGesture 判成「双击空白」—— 于是第二次点选被当成双击、多选直接失效。 */
 function pickTargetKey(pick) {
   if (!pick) return 'none';
   var subject = String(pick.subject || '');
@@ -1749,6 +2151,13 @@ function pickTargetKey(pick) {
   }
   if (subject === 'face' && pick.faceIndex != null) return 'face#' + pick.faceIndex;
   if (subject === 'edge' && pick.edgeIndex != null) return 'edge#' + pick.edgeIndex;
+  if (subject === 'sketchLine' && pick.polylineIndex != null) {
+    return 'sketchLine#' + (pick.sketchIndex | 0) + ':' + (pick.polylineIndex | 0);
+  }
+  if (subject === 'sketchPoint' && pick.polylineIndex != null && pick.pointIndex != null) {
+    return 'sketchPoint#' + (pick.sketchIndex | 0) + ':' + (pick.polylineIndex | 0) + ':' + (pick.pointIndex | 0);
+  }
+  if (subject === 'sketch' && pick.sketchIndex != null) return 'sketch#' + (pick.sketchIndex | 0);
   return 'none';
 }
 
@@ -1760,7 +2169,12 @@ function isDoubleClickGesture(previous, current, gapMs) {
   return pickTargetKey(previous) === pickTargetKey(current);
 }
 
-var MARKER_SUBJECT_LABELS = { face: '面', edge: '边', point: '点', vertex: '点', none: '画布' };
+/** 标记点的对象类型 → 中文名。缺表项会退化成「面」，所以**每个**能放标记的 subject 都必须在这里
+ *  （草图三档曾经漏了 → 标记文本变成「面 #-1」，直接进用户输入框发给模型）。 */
+var MARKER_SUBJECT_LABELS = {
+  face: '面', edge: '边', point: '点', vertex: '点', none: '画布',
+  sketchLine: '草图折线', sketchPoint: '草图端点', sketch: '草图',
+};
 
 /** 一个标记点的一行标注文本：`标记 #1（面 #12 @ [1.00,2.00,3.00]）`。纯函数。 */
 function markerLine(marker, index) {
@@ -1796,6 +2210,28 @@ var CONTEXT_MENU_DEFS = {
     { id: 'mark', label: '标记此处', behavior: 'mark' },
     { id: 'datum-point', label: '设为基准点', behavior: 'draft' },
   ],
+  // 草图折线 / 草图端点 / 整条草图：都能「全选本草图」，也都能把所选填进对话框。
+  // 全选入口**只**放在这里，不绑 Ctrl+A：Ctrl+A 是浏览器的「全选文本」，在这个面板里
+  // 抢过来只会让用户按一次就懵（而且输入框里再也全选不了字）。
+  // 「编辑这条草图」放在草图两种菜单里：整条草图档（subject:'sketch'）在拾取里不可达，
+  // 只靠那个入口的话这条最常用的路径会整体消失（用户升级后「点一下草图 → 编辑这条草图」
+  // 就再也点不到了）。放在这里，用户在任何草图对象上右键都能回到旧功能。
+  sketchLine: [
+    { id: 'mark', label: '标记此处', behavior: 'mark' },
+    { id: 'select-all', label: '全选本草图', behavior: 'action' },
+    { id: 'edit-sketch', label: '编辑这条草图', behavior: 'draft' },
+    { id: 'sketch-fill', label: '把所选填进对话框', behavior: 'draft' },
+  ],
+  sketchPoint: [
+    { id: 'mark', label: '标记此处', behavior: 'mark' },
+    { id: 'select-all', label: '全选本草图', behavior: 'action' },
+    { id: 'edit-sketch', label: '编辑这条草图', behavior: 'draft' },
+    { id: 'sketch-fill', label: '把所选填进对话框', behavior: 'draft' },
+  ],
+  sketch: [
+    { id: 'select-all', label: '全选本草图', behavior: 'action' },
+    { id: 'edit-sketch', label: '编辑这条草图', behavior: 'draft' },
+  ],
   none: [
     { id: 'fit', label: '适配', behavior: 'action' },
     { id: 'reset-view', label: '重置视角', behavior: 'action' },
@@ -1809,14 +2245,31 @@ function contextMenuSubjectOf(pick) {
   if (subject === 'point' || subject === 'vertex') return 'point';
   if (subject === 'face') return 'face';
   if (subject === 'edge') return 'edge';
+  if (subject === 'sketchLine') return 'sketchLine';
+  if (subject === 'sketchPoint') return 'sketchPoint';
+  if (subject === 'sketch') return 'sketch';
   return 'none';
 }
 
-function contextMenuItemsFor(pick) {
+/**
+ * 菜单项列表。第二个参数可选：{selectedLines, selectedPoints}（草图多选的条数）。
+ * 多选非空时在末尾追加「把所选填进对话框」—— 用户在菜单里点它，就把整组选择
+ * （N 条线 + M 个点 + 合计长度）拼成一句可发给模型的指令（文本见 buildSketchSelectionInstruction）。
+ * 不传 options 时行为与旧版完全一致（面对/边对/点对/空白对仍是 2–3 项）。
+ */
+function contextMenuItemsFor(pick, options) {
+  var opts = options || {};
   var defs = CONTEXT_MENU_DEFS[contextMenuSubjectOf(pick)] || CONTEXT_MENU_DEFS.none;
-  return defs.map(function (item) {
+  var items = defs.map(function (item) {
     return { id: item.id, label: item.label, behavior: item.behavior };
   });
+  var selectedCount = (Number(opts.selectedLines) || 0) + (Number(opts.selectedPoints) || 0);
+  if (selectedCount > 0) {
+    var already = false;
+    for (var i = 0; i < items.length; i += 1) if (items[i].id === 'sketch-fill') already = true;
+    if (!already) items.push({ id: 'sketch-fill', label: '把所选填进对话框', behavior: 'draft' });
+  }
+  return items;
 }
 
 /** 指令里的「选中对象」片段：`面 #12（圆柱 Ø5，面积 78.5 mm²，法向 [-0.707,0,0.707]）`。纯函数。 */
@@ -1881,8 +2334,17 @@ function buildSketchInstruction(input) {
 
 /** 草图线颜色（青绿，和边线的白/浅灰、面高亮的蓝明显不同）。 */
 var SKETCH_COLOR = 0x57d1a8;
-/** 悬停/选中某条草图时的强调色。 */
+/** **选中**某条草图折线/整条草图时的强调色（亮琥珀）。 */
 var SKETCH_HOVER_COLOR = 0xffe479;
+/** **悬停**到某条折线时的颜色：比选中色暗一档、淡一档（选中仍是 SKETCH_HOVER_COLOR 原色）。
+ *  悬停与选中是两块几何、两个材质、两个颜色 —— 否则「鼠标扫过」和「已选中」在画面上
+ *  物理上无法区分（这是真实的可用性缺陷，不是配色偏好）。 */
+var SKETCH_HOVER_LINE_COLOR = 0xa8903f;
+/** 悬停折线的不透明度（比选中的 1 淡，进一步拉开层级）。 */
+var SKETCH_HOVER_LINE_OPACITY = 0.7;
+/** 「整条草图被指到」的强调色：提亮的草图本色（青绿）。**必须不等于** SKETCH_HOVER_COLOR
+ *  （选中色 0xffe479）——否则悬停时整条草图与已选中的折线同色，多选高亮被淹没。 */
+var SKETCH_EMPHASIS_COLOR = 0x9af5d6;
 /** 草图线不透明度：半透明才看得见「线在实体之上」这件事。 */
 var SKETCH_OPACITY = 0.9;
 /** 相机到模型中心的距离 / 模型对角线 超过这个倍数就隐藏草图标签（贴着模型才看文字）。
@@ -1890,6 +2352,21 @@ var SKETCH_OPACITY = 0.9;
 var SKETCH_LABEL_HIDE_RATIO = 2.2;
 /** 草图拾取容差（相对模型对角线）。比边线大一点：草图是「浮在上面的细线」，用户点不准。 */
 var SKETCH_PICK_RATIO = 0.012;
+/** 草图端点（「点」）的拾取容差：比折线大 1.5 倍。
+ *  理由：折线是一整条「管道」，射线落进管道就算命中；端点只是一个点，用户在屏幕上瞄的是一个
+ *  disk 而不是一条线，容差和线一样大就几乎点不中，「点 > 线」的优先级永远轮不到。
+ *  取 0.018（= 0.012 × 1.5）不会抢走实体：实体顶点/边/面在 pickSubjectByPriority 里排在草图之前，
+ *  草图拾取只在射线没打到任何实体、或草图视图（没有实体）时才发生。 */
+var SKETCH_POINT_PICK_RATIO = 0.018;
+/** 草图折线种类的中文名（信息条与指令文本共用一份，避免两处说法不一致）。 */
+var SKETCH_KIND_LABELS = { line: '直线', arc: '圆弧', circle: '圆', spline: '样条', polyline: '折线' };
+
+/** 折线种类 → 中文名（未知种类原样返回）。纯函数。 */
+function sketchKindLabel(kind) {
+  var key = String(kind || 'line');
+  return SKETCH_KIND_LABELS[key] || key;
+}
+
 /** 草图开关的默认态：关（不打扰默认的模型查看）。 */
 var SKETCH_DEFAULT_ON = false;
 
@@ -1939,6 +2416,634 @@ function buildSketchSegmentPositions(polylines) {
 /** buildSketchSegmentPositions 里的顶点数（拆出来便于测试断言）。纯函数。 */
 function SketchVertexCountSafe(polylines) {
   return sketchPolylineVertexCount(polylines);
+}
+
+/**
+ * 「LineSegments 的段下标 → 折线下标」映射。纯函数。
+ * 为什么要它：一条草图现在只画一个合并的 LineSegments（buildSketchSegmentPositions 按折线顺序
+ * 成对追加端点），所以 raycast 回来的 `intersection.index` 是**顶点下标**（第 s 段是 2s、2s+1），
+ * 光看它不知道属于哪条折线。这里按同一个遍历顺序再走一遍，得到逐段的折线下标 —— 两处都跳过
+ * points.length < 2 的折线，所以本表的段数与 position 属性严格一致（段数 = 顶点数 / 2）。
+ * @returns {{segmentCount:number, polylineOfSegment:number[], startOfPolyline:number[], countOfPolyline:number[]}}
+ */
+function buildSketchSegmentIndex(polylines) {
+  var list = Array.isArray(polylines) ? polylines : [];
+  var polylineOfSegment = [];
+  var startOfPolyline = [];
+  var countOfPolyline = [];
+  // 逐段的包围球（前 3 个 float = 球心，第 4 个 = 半径）：段拾取用它做**早期剔除**，
+  // 免得每条草图每条射线都要把所有段算一遍 raySegmentDistance。一维数组比对象数组省一半内存。
+  var bounds = [];
+  for (var i = 0; i < list.length; i += 1) {
+    var count = sketchPolylineSegmentCount(list[i]);
+    startOfPolyline.push(polylineOfSegment.length);
+    countOfPolyline.push(count);
+    var points = list[i] && Array.isArray(list[i].points) ? list[i].points : [];
+    var closed = list[i] && list[i].closed === true;
+    for (var j = 0; j < count; j += 1) {
+      polylineOfSegment.push(i);
+      var a = points[j];
+      var b = closed && j === points.length - 1 ? points[0] : points[j + 1];
+      if (!a || !b) { bounds.push(0, 0, 0, 0); continue; }
+      var ax = Number(a[0]) || 0, ay = Number(a[1]) || 0, az = Number(a[2]) || 0;
+      var bx = Number(b[0]) || 0, by = Number(b[1]) || 0, bz = Number(b[2]) || 0;
+      var dx = bx - ax, dy = by - ay, dz = bz - az;
+      bounds.push((ax + bx) / 2, (ay + by) / 2, (az + bz) / 2,
+        Math.sqrt(dx * dx + dy * dy + dz * dz) / 2);
+    }
+  }
+  return {
+    segmentCount: polylineOfSegment.length,
+    polylineOfSegment: polylineOfSegment,
+    startOfPolyline: startOfPolyline,
+    countOfPolyline: countOfPolyline,
+    segmentBounds: bounds,
+  };
+}
+
+/**
+ * 「草图端点下标 → 折线/点下标」的扁平化索引。纯函数（除了一个全局构建计数器）。
+ * 为什么要它：端点拾取是 O(点数) 扫描，50000 点时分配 [] 数组 + 调 pointRayDistance
+ * （内部还建两层闭包）单次就要 2.5ms 量级 —— 一次 pointermove 就吃掉 15% 帧预算。
+ * 这里把点坐标放进一个 Float32Array，配两条 Int32Array 反查表，扫描循环里只有数组下标与乘加，
+ * 不分配任何对象（object-per-point 是主要成本）。
+ * **必须随 entry 缓存**（见 buildSketchEntry 的 entry.pointIndex / pickSketchCandidates）：
+ * 每次 pointermove 重建索引会把这点收益全部吃掉。SKETCH_POINT_INDEX_BUILDS 就是给测试
+ * 断言「热路径没有反复重建」用的（M6 变异：把 entry.pointIndex 换回 entry.polylines 会飙升）。
+ * @returns {{pointCount:number, positions:Float32Array, polylineOfPoint:Int32Array, pointIndexOfPoint:Int32Array}}
+ */
+function buildSketchPointIndex(polylines) {
+  SKETCH_POINT_INDEX_BUILDS += 1;
+  var list = Array.isArray(polylines) ? polylines : [];
+  var total = 0;
+  for (var i = 0; i < list.length; i += 1) {
+    var pts = list[i] && Array.isArray(list[i].points) ? list[i].points : [];
+    for (var j = 0; j < pts.length; j += 1) {
+      var p = pts[j];
+      if (p && p.length >= 3) total += 1;
+    }
+  }
+  var positions = new Float32Array(total * 3);
+  var polylineOfPoint = new Int32Array(total);
+  var pointIndexOfPoint = new Int32Array(total);
+  var at = 0;
+  for (var a = 0; a < list.length; a += 1) {
+    var points = list[a] && Array.isArray(list[a].points) ? list[a].points : [];
+    for (var b = 0; b < points.length; b += 1) {
+      var q = points[b];
+      if (!q || q.length < 3) continue;
+      positions[at * 3] = Number(q[0]) || 0;
+      positions[at * 3 + 1] = Number(q[1]) || 0;
+      positions[at * 3 + 2] = Number(q[2]) || 0;
+      polylineOfPoint[at] = a;
+      pointIndexOfPoint[at] = b;
+      at += 1;
+    }
+  }
+  return {
+    pointCount: at,
+    positions: positions,
+    polylineOfPoint: polylineOfPoint,
+    pointIndexOfPoint: pointIndexOfPoint,
+  };
+}
+
+/** 两个点之间的欧氏距离（不足三位按 0 补齐）。纯函数。 */
+function distance3(a, b) {
+  var ax = a && a.length >= 3 ? Number(a[0]) || 0 : 0;
+  var ay = a && a.length >= 3 ? Number(a[1]) || 0 : 0;
+  var az = a && a.length >= 3 ? Number(a[2]) || 0 : 0;
+  var bx = b && b.length >= 3 ? Number(b[0]) || 0 : 0;
+  var by = b && b.length >= 3 ? Number(b[1]) || 0 : 0;
+  var bz = b && b.length >= 3 ? Number(b[2]) || 0 : 0;
+  var dx = bx - ax, dy = by - ay, dz = bz - az;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+/** 一条折线的长度（mm）：按点序列累加欧氏距离，闭合折线补上「末点 → 首点」那一段。
+ *  草图坐标本身就是 mm，所以不用换算。圆弧/圆是多边形逼近，这里的长度是**弦长和**（略小于真实弧长）。纯函数。 */
+function sketchPolylineLengthMm(line) {
+  var points = line && Array.isArray(line.points) ? line.points : [];
+  if (points.length < 2) return 0;
+  var total = 0;
+  for (var i = 0; i + 1 < points.length; i += 1) total += distance3(points[i], points[i + 1]);
+  if (line.closed === true) total += distance3(points[points.length - 1], points[0]);
+  return total;
+}
+
+/** 一条折线的端点：start = 首点；end = 闭合折线取首点，否则取末点。纯函数。 */
+function sketchPolylineEndpoints(line) {
+  var points = line && Array.isArray(line.points) ? line.points : [];
+  if (!points.length) return { start: null, end: null };
+  var toArray = function (p) { return [Number(p[0]) || 0, Number(p[1]) || 0, Number(p[2]) || 0]; };
+  var start = toArray(points[0]);
+  var end = line.closed === true ? start.slice() : toArray(points[points.length - 1]);
+  return { start: start, end: end };
+}
+
+/** 一条折线的锚点（卡片/HUD 贴哪儿）：取点序列里位于中间的那个点，稳定且够近。纯函数。 */
+function sketchPolylineAnchor(line) {
+  var points = line && Array.isArray(line.points) ? line.points : [];
+  if (!points.length) return null;
+  var p = points[Math.floor(points.length / 2)] || points[0];
+  return [Number(p[0]) || 0, Number(p[1]) || 0, Number(p[2]) || 0];
+}
+
+/** 射线 → 最近的草图**端点**。阈值 = 调用方给的（点用 SKETCH_POINT_PICK_RATIO 换算过的那个）。
+ *  第一个参数可以是折线数组（内部建索引），也可以直接给 buildSketchPointIndex 的结果
+ *  （热路径 `pickSketchCandidates` 走后者：索引随 entry 缓存，pointermove 不再逐次重建）。
+ *  循环里**不分配对象**、不调 pointRayDistance（它要为每个点建两层闭包），
+ *  距离先用平方比较，只有最终命中点才开方 —— 50000 点实测单次从 2.5ms 降到 <1ms。
+ *  @returns {{polylineIndex:number, pointIndex:number, position:number[], distance:number}|null} 纯函数。 */
+function pickSketchPointInPolylines(polylines, origin, direction, threshold) {
+  var index = null;
+  if (Array.isArray(polylines)) index = buildSketchPointIndex(polylines);
+  else if (polylines && typeof polylines.pointCount === 'number') index = polylines;
+  var count = index ? index.pointCount : 0;
+  var positions = index ? index.positions : null;
+  if (!(count > 0) || !positions) return null;
+  var limit = Number(threshold) > 0 ? Number(threshold) : 0;
+  var ox = Array.isArray(origin) ? (Number(origin[0]) || 0) : (Number(origin && origin.x) || 0);
+  var oy = Array.isArray(origin) ? (Number(origin[1]) || 0) : (Number(origin && origin.y) || 0);
+  var oz = Array.isArray(origin) ? (Number(origin[2]) || 0) : (Number(origin && origin.z) || 0);
+  var dx = Array.isArray(direction) ? (Number(direction[0]) || 0) : (Number(direction && direction.x) || 0);
+  var dy = Array.isArray(direction) ? (Number(direction[1]) || 0) : (Number(direction && direction.y) || 0);
+  var dz = Array.isArray(direction) ? (Number(direction[2]) || 0) : (Number(direction && direction.z) || 0);
+  var len2 = dx * dx + dy * dy + dz * dz;
+  var ux = 0, uy = 0, uz = 0;
+  if (len2 > 1e-12) {
+    var inv = 1 / Math.sqrt(len2);
+    ux = dx * inv; uy = dy * inv; uz = dz * inv;
+  }
+  var limit2 = limit * limit;
+  var bestAt = -1;
+  var bestD2 = Infinity;
+  for (var i = 0; i < count; i += 1) {
+    var i3 = i * 3;
+    var px = positions[i3] - ox, py = positions[i3 + 1] - oy, pz = positions[i3 + 2] - oz;
+    var t = px * ux + py * uy + pz * uz;
+    var qx, qy, qz, d2;
+    if (t > 0) {
+      qx = px - ux * t; qy = py - uy * t; qz = pz - uz * t;
+      d2 = qx * qx + qy * qy + qz * qz;
+    } else {
+      // 射线起点背后（t <= 0）：距离按「到射线起点」算，与 pointRayDistance 的 t=0 夹取一致
+      d2 = px * px + py * py + pz * pz;
+    }
+    if (!(d2 <= limit2)) continue;
+    if (d2 < bestD2) { bestD2 = d2; bestAt = i; }
+  }
+  if (bestAt < 0) return null;
+  var p3 = bestAt * 3;
+  return {
+    polylineIndex: index.polylineOfPoint ? index.polylineOfPoint[bestAt] : 0,
+    pointIndex: index.pointIndexOfPoint ? index.pointIndexOfPoint[bestAt] : bestAt,
+    distance: Math.sqrt(bestD2),
+    position: [positions[p3], positions[p3 + 1], positions[p3 + 2]],
+  };
+}
+
+/** 射线 → 最近的草图**折线段**。段下标 → 折线下标查的是 buildSketchSegmentIndex 的表
+ *  （第 s 段的两个端点在 positions 里的浮点偏移是 6s 与 6s+3）。纯函数。
+ *  复杂度 O(段数)，但先用每段包围球做早期剔除（包围球在一维数组里连续放着，比 raySegmentDistance
+ *  便宜一个量级）。5000 点 / 4950 段实测单次拾取约 0.04ms（数字由 test/sketch-select.mjs 现场测、
+ *  现场断言，不写死在这里免得注释和事实再次脱节）。 */
+function pickSketchSegmentInPositions(positions, segmentIndex, origin, direction, threshold) {
+  var count = segmentIndex && typeof segmentIndex.segmentCount === 'number' ? segmentIndex.segmentCount : 0;
+  var map = segmentIndex && Array.isArray(segmentIndex.polylineOfSegment) ? segmentIndex.polylineOfSegment : [];
+  var bounds = segmentIndex && Array.isArray(segmentIndex.segmentBounds) ? segmentIndex.segmentBounds : null;
+  if (!positions || !positions.length || count <= 0) return null;
+  var limit = Number(threshold) > 0 ? Number(threshold) : 0;
+  // 归一化方向：让「射线参数 t」与长度同单位，才能拿 t 跟包围球半径比
+  var dl = Math.sqrt(direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2]);
+  var ux = dl > 1e-12 ? direction[0] / dl : 0;
+  var uy = dl > 1e-12 ? direction[1] / dl : 0;
+  var uz = dl > 1e-12 ? direction[2] / dl : 0;
+  var best = null;
+  for (var s = 0; s < count; s += 1) {
+    var base = s * 6;
+    if (base + 5 >= positions.length) break;
+    if (bounds) {
+      // 包围球快速剔除：射线到球心的垂距 > 半径 + 阈值 → 这一段的最近距离必然超阈值。
+      // 射线起点落在球内（t<0）时不用这个判据，直接进入精确计算。
+      var bx0 = bounds[s * 4], by0 = bounds[s * 4 + 1], bz0 = bounds[s * 4 + 2], br = bounds[s * 4 + 3];
+      var wx = bx0 - origin[0], wy = by0 - origin[1], wz = bz0 - origin[2];
+      var tDot = wx * ux + wy * uy + wz * uz;
+      var reach = br + limit;
+      if (tDot > 0) {
+        var px = wx - ux * tDot, py = wy - uy * tDot, pz = wz - uz * tDot;
+        if (px * px + py * py + pz * pz > reach * reach) continue;
+      } else if (wx * wx + wy * wy + wz * wz > reach * reach) {
+        continue;
+      }
+    }
+    var a = [positions[base], positions[base + 1], positions[base + 2]];
+    var b = [positions[base + 3], positions[base + 4], positions[base + 5]];
+    var hit = raySegmentDistance(origin, direction, a, b);
+    if (!hit || !(hit.distance <= limit)) continue;
+    if (!best || hit.distance < best.distance) {
+      best = {
+        polylineIndex: typeof map[s] === 'number' ? map[s] : -1,
+        segmentIndex: s,
+        segmentT: hit.segmentT,
+        distance: hit.distance,
+        point: hit.point,
+      };
+    }
+  }
+  return best;
+}
+
+/* ---------------- 草图多选：键设计 + 纯逻辑（不碰 scene，方便离线断言） ----------------
+ * 多选集合用两个 **Set**（不是塞进单值的 selectedSketchIndex）：
+ *   selectedSketchLines  : Set<'sk:<草图下标>:<折线下标>'>                 例 'sk:0:3'
+ *   selectedSketchPoints : Set<'sk:<草图下标>:<折线下标>:pt:<点下标>'>      例 'sk:0:3:pt:7'
+ * 键里带草图下标 → 多条草图同屏时不会互相串味；Set 保持插入顺序，信息条按点选顺序列。
+ * 单选（面/边/实体点）与草图多选是互斥的两套：选中实体对象时草图集合清空（反之亦然）。 */
+
+/** 草图折线的多选键。纯函数。 */
+function sketchLineKey(sketchIndex, polylineIndex) {
+  return 'sk:' + (sketchIndex | 0) + ':' + (polylineIndex | 0);
+}
+
+/** 草图端点的多选键。纯函数。 */
+function sketchPointKey(sketchIndex, polylineIndex, pointIndex) {
+  return sketchLineKey(sketchIndex, polylineIndex) + ':pt:' + (pointIndex | 0);
+}
+
+/** 多选键 → {sketchIndex, polylineIndex, pointIndex}（线 pointIndex = -1；解析不了返回 null）。纯函数。 */
+function parseSketchSelectionKey(key) {
+  var m = /^sk:(-?\d+):(-?\d+)(?::pt:(-?\d+))?$/.exec(String(key == null ? '' : key));
+  if (!m) return null;
+  return {
+    sketchIndex: Number(m[1]),
+    polylineIndex: Number(m[2]),
+    pointIndex: m[3] == null ? -1 : Number(m[3]),
+  };
+}
+
+/**
+ * Ctrl/Cmd 多选的状态机（纯函数：输入输出都是 {lines:Set, points:Set}）。
+ *   additive=false（不按 Ctrl 的单击）= **替换**：先清空两类集合，再把 picked 放进去；点空白 = 只清空。
+ *   additive=true （Ctrl/Cmd + 左键）= **累积**：点已选中的项 → 取消该项（toggle），点未选中项 → 加入，
+ *                点空白 → 不清空（用户按着 Ctrl 点空白几乎都是手滑）。
+ * 只有 subject 为 'sketchLine' / 'sketchPoint' 的 pick 会进草图集合；其它 subject（面/边/实体点）
+ * 交给原来的单选逻辑，这里只保证「替换」时把草图集合清干净。
+ */
+function updateSketchSelection(state, pick, additive) {
+  var prev = state || {};
+  var lines = new Set(prev.lines ? Array.from(prev.lines) : []);
+  var points = new Set(prev.points ? Array.from(prev.points) : []);
+  var next = { lines: lines, points: points };
+  var subject = pick ? String(pick.subject || '') : '';
+  var key = '';
+  if (subject === 'sketchLine') key = sketchLineKey(pick.sketchIndex, pick.polylineIndex);
+  else if (subject === 'sketchPoint') key = sketchPointKey(pick.sketchIndex, pick.polylineIndex, pick.pointIndex);
+  if (!additive) {
+    lines.clear();
+    points.clear();
+    if (key) {
+      if (subject === 'sketchLine') lines.add(key);
+      else points.add(key);
+    }
+    return next;
+  }
+  if (!key) return next;                       // Ctrl + 空白 / Ctrl + 实体对象：保持现有草图多选
+  var target = subject === 'sketchLine' ? lines : points;
+  if (target.has(key)) target.delete(key);
+  else target.add(key);
+  return next;
+}
+
+/** 多选集合里两项的个数：{lines, points}。纯函数。 */
+function sketchSelectionCounts(state) {
+  var s = state || {};
+  return {
+    lines: s.lines && typeof s.lines.size === 'number' ? s.lines.size : 0,
+    points: s.points && typeof s.points.size === 'number' ? s.points.size : 0,
+  };
+}
+
+/** 毫米数 → 固定一位小数的文本（合计长度按需求固定一位，不学 fmtNum 去尾零）。纯函数。 */
+function fmtMm1(v) {
+  return typeof v === 'number' && isFinite(v) ? v.toFixed(1) : '—';
+}
+
+/** 多选信息的**一行汇总**：`已选 2 条线、1 个点（合计 58.6 mm）`；
+ *  一条都没选时是 `未选中草图折线/点`。lines = [{lengthMm}]，points = [{…}]。纯函数。 */
+function sketchSelectionSummaryText(lines, points) {
+  var lineList = Array.isArray(lines) ? lines : [];
+  var pointList = Array.isArray(points) ? points : [];
+  if (!lineList.length && !pointList.length) return '未选中草图折线/点';
+  var total = 0;
+  for (var i = 0; i < lineList.length; i += 1) {
+    var length = Number(lineList[i] && lineList[i].lengthMm);
+    if (isFinite(length) && length > 0) total += length;
+  }
+  return '已选 ' + lineList.length + ' 条线、' + pointList.length + ' 个点（合计 ' + fmtMm1(total) + ' mm）';
+}
+
+/** 多选卡片文本：第一行汇总，随后每条线一行（序号+类型+长度），每个点一行（序号+坐标）。
+ *  **跨草图时必须带草图名 + 第几条区分**：两条草图各选一条 polylineIndex=0 的线，光有「线 #0」
+ *  分不清谁是谁；两条**同名**草图连名字都分不清，所以再加「第 N 条」（= sketchIndex + 1）。
+ *  只有一条草图时保持旧格式（不加前缀，信息条别啰嗦）。纯函数。 */
+function buildSketchSelectionText(lines, points) {
+  var lineList = Array.isArray(lines) ? lines : [];
+  var pointList = Array.isArray(points) ? points : [];
+  var out = [sketchSelectionSummaryText(lineList, pointList)];
+  // 有几个不同的草图？> 1 才需要前缀
+  var seen = {};
+  var sketchCount = 0;
+  var consider = function (item) {
+    if (!item || typeof item.sketchIndex !== 'number') return;
+    var key = String(item.sketchIndex);
+    if (!seen[key]) { seen[key] = true; sketchCount += 1; }
+  };
+  for (var c = 0; c < lineList.length; c += 1) consider(lineList[c]);
+  for (var d = 0; d < pointList.length; d += 1) consider(pointList[d]);
+  var multi = sketchCount > 1;
+  var prefixOf = function (item) {
+    if (!multi) return '';
+    var idx = typeof (item && item.sketchIndex) === 'number' ? item.sketchIndex : 0;
+    var name = String((item && item.sketchName) || ('#' + idx));
+    return '草图 ' + name + '（第 ' + (idx + 1) + ' 条） · ';
+  };
+  for (var i = 0; i < lineList.length; i += 1) {
+    var line = lineList[i] || {};
+    out.push(prefixOf(line) + '线 #' + (line.polylineIndex | 0) + '（' + sketchKindLabel(line.kind) +
+      '，长 ' + fmtMm1(Number(line.lengthMm)) + ' mm' + (line.closed ? '，闭合' : '') + '）');
+  }
+  for (var j = 0; j < pointList.length; j += 1) {
+    var point = pointList[j] || {};
+    out.push(prefixOf(point) + '点 折线#' + (point.polylineIndex | 0) + ' 点#' + (point.pointIndex | 0) +
+      ' @ ' + fmtPoint(point.position));
+  }
+  return out.join('\n');
+}
+
+/**
+ * 多选 → 按草图分组。跨草图选择时同一个 polylineIndex 会在两条草图里各出现一次，
+ * 光有编号分不清谁是谁，所以每一行都要带**它自己那条草图**的名字（sketchLineInfo 已经算了
+ * sketchName，这里直接用，不再让调用方传一个「主草图」）。
+ * 组名**不自带「草图」前缀**：模板里已经写了「草图 X」，回退名再带一个就会拼出「草图 草图 #1」。
+ * 基准面名也带上（sketchPlane）：两条同名草图只靠下标区分不够直观，加基准面更好认。
+ * @returns {Array<{sketchIndex:number, sketchName:string, sketchPlane:string, lines:Array, points:Array}>}
+ *          按首次出现顺序分组；组内保持多选集合的插入顺序。
+ */
+function groupSketchSelectionBySketch(lines, points) {
+  var groups = [];
+  var byKey = {};
+  function groupFor(item, fallbackIndex) {
+    var idx = typeof (item && item.sketchIndex) === 'number' ? item.sketchIndex : fallbackIndex;
+    var key = String(idx);
+    var hasName = !!(item && item.sketchName);
+    if (!byKey[key]) {
+      byKey[key] = {
+        sketchIndex: idx,
+        // 回退名**不带**「草图」二字（模板会前置），否则正文会出现「草图 草图 #1」
+        sketchName: hasName ? String(item.sketchName) : ('#' + idx),
+        sketchPlane: String((item && item.sketchPlane) || ''),
+        lines: [],
+        points: [],
+      };
+      groups.push(byKey[key]);
+    } else {
+      // 先遇到没有名字/没有基准面的项、后来遇到有的：补上真的
+      if (hasName && byKey[key].sketchName.indexOf('#') === 0) {
+        byKey[key].sketchName = String(item.sketchName);
+      }
+      if (!byKey[key].sketchPlane && item && item.sketchPlane) {
+        byKey[key].sketchPlane = String(item.sketchPlane);
+      }
+    }
+    return byKey[key];
+  }
+  var list = Array.isArray(lines) ? lines : [];
+  for (var i = 0; i < list.length; i += 1) groupFor(list[i], 0).lines.push(list[i]);
+  var pointList = Array.isArray(points) ? points : [];
+  for (var j = 0; j < pointList.length; j += 1) groupFor(pointList[j], 0).points.push(pointList[j]);
+  return groups;
+}
+
+/**
+ * 多选集合 → **带连续编号的段落计划**（指令文本与截图标记共用的唯一顺序来源）。
+ *
+ * 为什么要有这个函数：文本里如果只按 polylineIndex 编号，跨草图会撞号（两条草图都有 #0），
+ * 截图上的数字标记也没法与正文对上。这里统一产生 [1]…[N]：
+ *   - 顺序 = `groupSketchSelectionBySketch` 的分组顺序（首次出现顺序），组内**先折线后端点**；
+ *   - 编号**连续、从 1 开始**、不跳号；
+ *   - 指令文本的【②】/【③】段与 `getSnapshotMarkers()` 的 marker.label 用的是同一份顺序，
+ *     所以「截图上的 3」和正文里的「[3]」必然是同一个对象。
+ * 纯函数。
+ * @returns {{entries:Array, groups:Array, lineCount:number, pointCount:number, totalMm:number}}
+ */
+function sketchSelectionNumberedPlan(lines, points) {
+  var groups = groupSketchSelectionBySketch(lines, points);
+  var entries = [];
+  var numberedGroups = [];
+  var total = 0;
+  var number = 0;
+  for (var g = 0; g < groups.length; g += 1) {
+    var group = groups[g] || {};
+    var groupLines = [];
+    var groupPoints = [];
+    var gl = Array.isArray(group.lines) ? group.lines : [];
+    var gp = Array.isArray(group.points) ? group.points : [];
+    for (var a = 0; a < gl.length; a += 1) {
+      var line = gl[a] || {};
+      var length = Number(line.lengthMm);
+      if (isFinite(length) && length > 0) total += length;
+      number += 1;
+      var lineEntry = {
+        number: number,
+        kind: 'line',
+        sketchIndex: group.sketchIndex,
+        sketchName: group.sketchName,
+        sketchPlane: group.sketchPlane,
+        polylineIndex: line.polylineIndex | 0,
+        kindLabel: sketchKindLabel(line.kind),
+        lengthMm: isFinite(length) ? length : 0,
+        start: line.start,
+        end: line.end,
+        anchor: line.anchor,
+        closed: line.closed === true,
+      };
+      groupLines.push(lineEntry);
+      entries.push(lineEntry);
+    }
+    for (var b = 0; b < gp.length; b += 1) {
+      var point = gp[b] || {};
+      number += 1;
+      var pointEntry = {
+        number: number,
+        kind: 'point',
+        sketchIndex: group.sketchIndex,
+        sketchName: group.sketchName,
+        sketchPlane: group.sketchPlane,
+        polylineIndex: point.polylineIndex | 0,
+        pointIndex: point.pointIndex | 0,
+        position: point.position,
+      };
+      groupPoints.push(pointEntry);
+      entries.push(pointEntry);
+    }
+    numberedGroups.push({
+      sketchIndex: group.sketchIndex,
+      sketchName: group.sketchName,
+      sketchPlane: group.sketchPlane,
+      identity: sketchGroupIdentity(group),
+      lines: groupLines,
+      points: groupPoints,
+    });
+  }
+  return {
+    entries: entries,
+    groups: numberedGroups,
+    lineCount: entries.filter(function (e) { return e.kind === 'line'; }).length,
+    pointCount: entries.filter(function (e) { return e.kind === 'point'; }).length,
+    totalMm: total,
+  };
+}
+
+/** 【②】段里一条对象的写法：`[3] 折线 #0 直线` / `[4] 端点 折线#0 点#1`。纯函数。 */
+function numberedEntryTitle(entry) {
+  var e = entry || {};
+  if (e.kind === 'point') {
+    return '[' + e.number + '] 端点 折线#' + (e.polylineIndex | 0) + ' 点#' + (e.pointIndex | 0);
+  }
+  return '[' + e.number + '] 折线 #' + (e.polylineIndex | 0) + ' ' + (e.kindLabel || sketchKindLabel(e.kind));
+}
+
+/** 【③】段里一条对象的写法（坐标/长度，**参考数据**）：
+ *  `[3] 折线 #0 直线 长 20.0 mm 起点 [0.00,0.00,0.00] 终点 [20.00,0.00,0.00]`
+ *  `[4] 端点 折线#0 点#1 @ [20.00,0.00,0.00]`。纯函数。 */
+function numberedEntryReference(entry) {
+  var e = entry || {};
+  if (e.kind === 'point') {
+    return numberedEntryTitle(e) + ' @ ' + fmtPoint(e.position);
+  }
+  return numberedEntryTitle(e) + ' 长 ' + fmtMm1(Number(e.lengthMm)) + ' mm' +
+    ' 起点 ' + fmtPoint(e.start) + ' 终点 ' + fmtPoint(e.end) +
+    (e.closed ? '（闭合）' : '');
+}
+
+/**
+ * 「把所选填进对话框」的指令文本（**只生成文本，不改模型**）。纯函数。
+ *
+ * 设计目标（用户原话：「那张发给 agent 的消息和图片强调不够，文字部分总觉得不够好」）：
+ *   1. **第二人称祈使句**：开头就说清「用户选中了这些，需要你改」，不是「选中：…」式的状态汇报；
+ *   2. **段落层级**：① 任务 → ② 必须修改的对象 → ③ 坐标/长度（参考，不是目标）→
+ *      ④ 用户的修改意图（用户自己填）→ ⑤ 动手前先复述；
+ *   3. **显式禁令**：坐标只用来定位已有几何，**不要按坐标重新画**，否则 agent 会把参考值当目标重建；
+ *   4. **编号 [1]…[N]** 与截图上的数字标记一一对应（同一个 `sketchSelectionNumberedPlan`）；
+ *   5. 修改意见为空时给出**对模型有意义的**占位（不是「（在这里补完你想怎么改）」这种自说自话）。
+ *
+ * **按「草图组数」分流，不看 sketchName 有没有值**：sketchLineInfo **总是**填 sketchName
+ * （= 草图名 · 特征名），所以「有没有 sketchName」永远为真，拿它当前提会让单草图分支变成死代码，
+ * 实际后果是用户最常用的「一次只在一张草图里选几条线」丢掉「属于特征 / 绘制在 基准面」两句
+ * 模型最需要的信息。组数 === 1 走单草图写法，> 1 每图一组（跨草图时 polylineIndex 会撞号）。
+ */
+function buildSketchSelectionInstruction(input) {
+  var opts = input || {};
+  var sketch = opts.sketch || {};
+  var lines = Array.isArray(opts.lines) ? opts.lines : [];
+  var points = Array.isArray(opts.points) ? opts.points : [];
+  var note = typeof opts.note === 'string' ? opts.note.trim() : '';
+  var plan = sketchSelectionNumberedPlan(lines, points);
+  var groups = plan.groups;
+  var grouped = groups.length > 1;
+  var only = groups.length === 1 ? groups[0] : null;
+  var lineCount = plan.lineCount;
+  var pointCount = plan.pointCount;
+  var totalText = fmtMm1(plan.totalMm);
+  var countText = lineCount + ' 条折线、' + pointCount + ' 个端点（合计 ' + totalText + ' mm）';
+
+  var out = [];
+  out.push(ANNOTATION_SCHEME + ' 用户在这个 3D 视图里选中了以下草图几何，请你按用户的意图修改模型。');
+  out.push('（这是用户交给你的修改任务，不是状态汇报。下面按 ① → ⑤ 读。）');
+  out.push('文件：' + String(opts.file || '当前模型') + ' 设计ID：' + String(opts.designId || '(未知)'));
+
+  // ---- ① 任务
+  out.push('');
+  out.push('【① 任务】');
+  out.push('修改【② 必须修改的对象】里点名的 ' + countText + '，具体改法看【④ 修改意图】。');
+  out.push('只改这两段点名的对象；其它几何、尺寸、特征一律不要动。');
+
+  // ---- ② 必须修改的对象（编号与截图上的数字标记一一对应）
+  out.push('');
+  out.push('【② 必须修改的对象】用户在视图里点选的，就是这些（编号 [1]…[' + (plan.entries.length || 0) +
+    '] 与截图上的数字标记一一对应）：');
+  var selectLine;
+  if (!grouped) {
+    // 名字/特征/基准面来自 opts.sketch（调用方传的是 getSketchData 的原对象）；
+    // 没有 opts.sketch 时退回组里的名字，绝不出现 undefined。
+    var name = String(sketch.name || sketch.id || (only && only.sketchName) || 'Sketch');
+    var feature = String(sketch.feature || '');
+    var plane = String(sketch.plane || (only && only.sketchPlane) || '未知基准面');
+    selectLine = '选中：草图 ' + name +
+      (feature ? '（属于特征「' + feature + '」，绘制在 ' + plane + '）' : '（绘制在 ' + plane + '）') +
+      ' 的 ' + countText;
+    out.push(selectLine);
+    if (plan.entries.length) {
+      for (var e1 = 0; e1 < plan.entries.length; e1 += 1) out.push('  ' + numberedEntryTitle(plan.entries[e1]));
+    } else {
+      out.push('  （用户在视图里还没有点选任何折线/端点）');
+    }
+  } else {
+    // 分组：组名带「第 N 条」与基准面，两条**同名**草图也能区分开
+    selectLine = '选中：' + groups.length + ' 条草图上的 ' + countText;
+    out.push(selectLine);
+    for (var g = 0; g < groups.length; g += 1) {
+      var group = groups[g];
+      out.push('  草图 ' + group.sketchName + '（' + group.identity + '，' +
+        group.lines.length + ' 条折线 / ' + group.points.length + ' 个端点）：');
+      for (var gl = 0; gl < group.lines.length; gl += 1) out.push('    ' + numberedEntryTitle(group.lines[gl]));
+      for (var gp = 0; gp < group.points.length; gp += 1) out.push('    ' + numberedEntryTitle(group.points[gp]));
+    }
+  }
+
+  // ---- ③ 坐标与长度：参考数据，不是目标值
+  out.push('');
+  out.push('【③ 坐标与长度 · 参考数据，不是目标值】');
+  out.push('这些数字只用来在模型里**定位**【②】里已有的那些几何。');
+  out.push('不要按这些坐标重新画一遍几何，也不要把它们当成「要改成的目标值」——' +
+    '用户要改的是形状/位置关系，不是把这些数字再抄一遍。');
+  if (plan.entries.length) {
+    if (!grouped) {
+      for (var e2 = 0; e2 < plan.entries.length; e2 += 1) out.push('  ' + numberedEntryReference(plan.entries[e2]));
+    } else {
+      for (var g2 = 0; g2 < groups.length; g2 += 1) {
+        var group2 = groups[g2];
+        out.push('  草图 ' + group2.sketchName + '（' + group2.identity + '）：');
+        for (var l2 = 0; l2 < group2.lines.length; l2 += 1) out.push('    ' + numberedEntryReference(group2.lines[l2]));
+        for (var p2 = 0; p2 < group2.points.length; p2 += 1) out.push('    ' + numberedEntryReference(group2.points[p2]));
+      }
+    }
+  } else {
+    out.push('  （无：这次没有点选任何几何）');
+  }
+
+  // ---- ④ 用户的修改意图：用户自己补的那句话
+  out.push('');
+  out.push('【④ 修改意图】用户自己的补充（可能为空；「修改意见」之后就是用户写的原话）：');
+  out.push('修改意见：' + (note || '（用户还没写具体改法：先按【⑤】复述你定位到的对象，再问清楚要改成什么样）'));
+
+  // ---- ⑤ 先复述再动手
+  out.push('');
+  out.push('【⑤ 动手前先复述】');
+  out.push('先确认你定位到的就是【②】里这 ' + countText + '（草图名、折线号、起点/终点坐标都对得上），');
+  out.push('再给出修改方案并执行；对不上就先说明你实际找到的是哪些，不要凭坐标猜着改。');
+  return out.join('\n');
+}
+
+/** 分组标题里的「身份」部分：`第 2 条 / 基准面-前视`（没有基准面时只有「第 N 条」）。
+ *  为什么要它：两条草图可能**同名**，光有名字的两行文本在对话框里无法区分，
+ *  用户只能靠坐标去猜哪一行是哪条草图。纯函数。 */
+function sketchGroupIdentity(group) {
+  var g = group || {};
+  var idx = typeof g.sketchIndex === 'number' ? g.sketchIndex : 0;
+  var plane = String(g.sketchPlane || '');
+  return '第 ' + (idx + 1) + ' 条' + (plane ? ' / ' + plane : '');
 }
 
 /** 草图标签文本：`plate_band · 拉伸 plate_band_solid`。纯函数。 */
@@ -2978,6 +4083,15 @@ function precisionTierOf(name) {
   return PRECISION_TIERS[key] || PRECISION_TIERS[DEFAULT_PRECISION];
 }
 
+/** 精度按钮的 title 文案。数字一律从 PRECISION_TIERS 现算，不写字面量：
+ *  旧的写死文案（「deflaction 0.1 / 0.2 / 0.5」）在档位调整后就和表分叉了，
+ *  用户 hover 看到的毫米数会是错的。纯函数。 */
+function precisionTierTitle(name) {
+  var tier = precisionTierOf(name);
+  return tier.label + '精度（deflaction ' + fmtCompactNum(tier.deflection) +
+    '，三角形上限 ' + fmtCompactNum(Number(tier.maxTriangles) / 10000) + ' 万）';
+}
+
 /** Best-effort tier name for an explicit deflection value (cache-key compatibility). */
 function precisionKeyForDeflection(deflection) {
   var keys = Object.keys(PRECISION_TIERS);
@@ -3078,9 +4192,168 @@ function fetchMeshBuffer(path, deflectionOrPrecision, refresh, extra) {
   });
   return promise;
 }
-/** Full host pipeline: /sw3d/ping -> /sw3d/resolve -> /sw3d/mesh -> parseS3DM.
- *  Reports progress through opts.onProgress(message, detail) and the resolve
- *  payload through opts.onResolved(payload); rejects with httpError {code, hint}. */
+/* ------------------------------------------------------------------ */
+/* 草图视图（sketch-only）：原生件没有 STEP 时的降级模型                  */
+/*                                                                     */
+/* 宿主 /sw3d/resolve 返回 meshSource:'sketch-only' 时，这里不做「红字失败  */
+/* 卡」，而是造一个**合法但没有三角形**的模型对象，交给同一个 createViewer  */
+/* 渲染草图叠加层。为什么还要造模型而不是直接不建 viewer：                 */
+/*   - 相机/轨道/缩放/截图/草图拾取都在 createViewer 里，复用它们比复制一套 */
+/*     只画线的最小渲染器省事，也不会和行为分叉；                       */
+/*   - 面/边/点三套几何都用空 buffer，天然「点了没反应」→ 上层按 isSketchOnly */
+/*     显式禁用并说明原因（不能留一堆按下去没反应的按钮）。                */
+/* 包围盒必须来自草图坐标：空网格走 bboxFromPositions 会退化成 1mm 小盒，   */
+/* 相机就会贴到原点上一片空白。                                          */
+/* ------------------------------------------------------------------ */
+
+/** 草图数据 → 所有折线点的世界包围盒；没有可用坐标返回 null。纯函数。 */
+function sketchPayloadBbox(payload) {
+  var sketches = payload && Array.isArray(payload.sketches) ? payload.sketches : [];
+  var minX = Infinity, minY = Infinity, minZ = Infinity;
+  var maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  var points = 0;
+  for (var i = 0; i < sketches.length; i += 1) {
+    var polylines = sketches[i] && Array.isArray(sketches[i].polylines) ? sketches[i].polylines : [];
+    for (var j = 0; j < polylines.length; j += 1) {
+      var list = polylines[j] && Array.isArray(polylines[j].points) ? polylines[j].points : [];
+      for (var k = 0; k < list.length; k += 1) {
+        var p = list[k];
+        if (!p || p.length < 3) continue;
+        var x = Number(p[0]), y = Number(p[1]), z = Number(p[2]);
+        if (!isFinite(x) || !isFinite(y) || !isFinite(z)) continue;
+        points += 1;
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+        if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+      }
+    }
+  }
+  if (!points) return null;
+  return [minX, minY, minZ, maxX, maxY, maxZ];
+}
+
+/** 把退化包围盒撑开到至少 minSize（mm），免得相机 near/far 与 fit 被零体积坑掉。纯函数。 */
+function inflateBbox(bbox, minSize) {
+  var box = Array.isArray(bbox) && bbox.length === 6 ? bbox.slice() : [-1, -1, -1, 1, 1, 1];
+  var min = Number(minSize) > 0 ? Number(minSize) : 1;
+  for (var axis = 0; axis < 3; axis += 1) {
+    var span = box[axis + 3] - box[axis];
+    if (!isFinite(span) || span >= min) continue;
+    var center = (box[axis] + box[axis + 3]) / 2;
+    if (!isFinite(center)) center = 0;
+    box[axis] = center - min / 2;
+    box[axis + 3] = center + min / 2;
+  }
+  return box;
+}
+
+/** 草图视图的模型对象：形状与 parseS3DM 的结果一致，但三角形/面/边全为 0。纯函数。 */
+function buildSketchOnlyModel(payload, options) {
+  var opts = options || {};
+  var bbox = inflateBbox(sketchPayloadBbox(payload), opts.minSize || 1);
+  var sketches = payload && Array.isArray(payload.sketches) ? payload.sketches : [];
+  var polylineCount = 0;
+  for (var i = 0; i < sketches.length; i += 1) {
+    polylineCount += Array.isArray(sketches[i] && sketches[i].polylines) ? sketches[i].polylines.length : 0;
+  }
+  return {
+    header: {
+      version: 0,
+      units: 'mm',
+      format: opts.format || 'sketch',
+      source: { path: opts.path || '', bytes: 0, mtimeMs: 0 },
+      bbox: bbox,
+      vertexCount: 0,
+      triangleCount: 0,
+      faceCount: 0,
+      edgeCount: 0,
+      faceEdgeCount: 0,
+      faces: [],
+      edges: [],
+      warnings: [],
+    },
+    version: 0,
+    units: 'mm',
+    format: opts.format || 'sketch',
+    source: { path: opts.path || '', bytes: 0, mtimeMs: 0 },
+    bbox: bbox,
+    faces: [],
+    edges: [],
+    position: new Float32Array(0),
+    normal: new Float32Array(0),
+    index: new Uint32Array(0),
+    faceOfTriangle: new Uint32Array(0),
+    edgePosition: null,
+    edgeSegment: null,
+    faceEdge: null,
+    faceEdgeIndex: buildFaceEdgeIndex([], [], null),
+    precision: null,
+    deflectionMm: null,
+    edgeGeometry: { positions: new Float32Array(0), segmentEdge: new Uint32Array(0), ranges: [], rangeByEdge: new Map(), pointCount: 0, segmentCount: 0 },
+    // 显式标记：上层据此禁用面/边/点相关能力，而不是让按钮点了没反应
+    sketchOnly: true,
+    sketch: payload || null,
+    stats: {
+      vertexCount: 0,
+      triangleCount: 0,
+      faceCount: 0,
+      edgeCount: 0,
+      sketchCount: sketches.length,
+      polylineCount: polylineCount,
+    },
+    warnings: [],
+  };
+}
+
+/** 草图视图下被禁用能力的清单。**这份数组只喂提示文案**（`sketchOnlyDisabledText()` 与 `__test`），
+ *  工具栏按钮的禁用态是 ViewerBody 里按 `isSketchOnly` 字面量各自决定的，两者并不互相驱动 ——
+ *  所以改这里不会让某个按钮变灰，只改用户读到的那句话。
+ *  注意 'pick' 这一项的措辞：它**不是**「拾取整体不可用」，而是「**实体的**面/边/点拾取不可用」。
+ *  草图视图下拾取本身是**可用**的，只是拾取对象换成了草图的折线/端点（见 pickSketchCandidates、
+ *  草图多选）。旧文案「面/边/点拾取 不可用」会让人以为整个拾取被关掉，结果用户在最需要点选
+ *  草图的视图里什么都不点 —— 那是个真实缺陷。
+ *  id 仍保留为 'pick'：它是稳定标识（测试与 UI 提示都按 id 取），只改 label/reason 的语义。
+ *  'marker' 同理保留 id、**改对语义**：草图视图下双击草图折线/端点**是**能放标记的（见 addMarker
+ *  的 sketchLine/sketchPoint 分支），旧文案「标记要挂在面/边/点上」等于对用户说反话。 */
+var SKETCH_ONLY_DISABLED = [
+  { id: 'pick', label: '实体面/边/点拾取', reason: '没有实体；草图折线与端点仍然可以点选（Ctrl/Cmd 多选）' },
+  { id: 'section', label: '剖切/封盖', reason: '剖切是对实体做的，草图没有实体可剖' },
+  { id: 'sample', label: 'Alt+三点取样', reason: '取样取的是实体面上的点' },
+  { id: 'wireframe', label: '着色/线框', reason: '没有三角面可以着色' },
+  { id: 'edges', label: '边线', reason: '没有任何 B-rep 边' },
+  { id: 'precision', label: '精度档', reason: '草图没有三角化过程' },
+  { id: 'marker', label: '实体面/边/点上的标记', reason: '没有实体可挂；草图折线与端点上的标记仍然可以放（双击或右键「标记此处」）' },
+];
+
+/** 禁用清单 → 一句话说明（提示条/图例用）。纯函数。 */
+function sketchOnlyDisabledText() {
+  return SKETCH_ONLY_DISABLED.map(function (item) { return item.label; }).join('、') + ' 不可用（没有实体）';
+}
+
+/** 草图视图的信息条文案。纯函数（输入是 model，方便离线断言）。 */
+function buildSketchOnlyNotice(model) {
+  var sketch = (model && model.sketch) || {};
+  var stats = (model && model.stats) || {};
+  var sketchCount = Number(stats.sketchCount) || (Array.isArray(sketch.sketches) ? sketch.sketches.length : 0);
+  var polylineCount = Number(stats.polylineCount) || 0;
+  var parts = [];
+  parts.push('当前只显示草图轮廓（草图 ' + sketchCount + ' 条 / 折线 ' + polylineCount + ' 条），**没有实体**；' +
+    '可以点选折线与端点，Ctrl/Cmd+左键 多选');
+  var designId = sketch.designId || (model && model.resolve && model.resolve.designId) || '';
+  if (designId) parts.push('设计 ' + designId);
+  parts.push(sketchOnlyDisabledText());
+  var deliver = (model && model.resolve && model.resolve.deliver) || '';
+  var solidFeatures = (model && model.resolve && model.resolve.sketch &&
+    typeof model.resolve.sketch.solidFeatureCount === 'number') ? model.resolve.sketch.solidFeatureCount : -1;
+  if (solidFeatures === 0) {
+    parts.push('这个设计只有草图（零实体），导不出 STEP：想看到实体请先在 SOLIDWORKS 里把它拉伸成实体');
+  } else if (deliver) {
+    parts.push('想看到实体请让 agent 执行 ' + deliver);
+  }
+  return parts.join(' · ');
+}
+
+
 function loadModelData(absPath, options) {
   var opts = options || {};
   var report = isFn(opts.onProgress) ? opts.onProgress : noop;
@@ -3107,6 +4380,24 @@ function loadModelData(absPath, options) {
       throw httpError((resolved && resolved.message) || '该文件没有可用的 3D 数据', {
         hint: (resolved && resolved.hint) || '',
         code: (resolved && resolved.code) || 'NO_MESH_SOURCE',
+      });
+    }
+    // 草图视图：宿主明确说「只有草图、没有 STEP 网格」。不请求 /sw3d/mesh（那边会回 JSON
+    // 而不是 S3DM），直接取草图数据造一个 0 三角形的模型给同一个 viewer。
+    if (resolved.meshSource === 'sketch-only') {
+      report('加载草图轮廓…', '该文件没有可用的 STEP，改为显示草图');
+      return fetchSketches(absPath, true).then(function (payload) {
+        if (!payload || payload.ok !== true) {
+          // 解析时还能读到草图、现在读不到了：退回失败卡片，并把两边的原因都说清楚
+          throw httpError('这个文件没有可用的 STEP 网格，草图数据也读不出来', {
+            hint: (payload && payload.hint) || (resolved.hint || ''),
+            code: (payload && payload.code) || 'NO_SKETCH_DATA',
+          });
+        }
+        report('草图轮廓已就绪', '没有实体：只画草图');
+        var model = buildSketchOnlyModel(payload, { path: absPath, format: resolved.format });
+        model.resolve = resolved;
+        return model;
       });
     }
     var sourceLabel;
@@ -3222,6 +4513,11 @@ function createViewer(container, model, callbacks) {
     capSolid: isDark ? 0x8a7f76 : 0x7d746c,
     sample: 0xfacc15,
     marker: 0xffb020,
+    // 草图多选：**选中**折线/端点的强调色（= SKETCH_HOVER_COLOR）
+    sketchPick: 0xffe479,
+    // 草图悬停：**悬停**折线的颜色（= SKETCH_HOVER_LINE_COLOR）—— 必须与 sketchPick 不同，
+    // 「鼠标扫过」和「已选中」是两个层级，同色等于没有指示
+    sketchHoverLine: 0xa8903f,
   };
 
   var scene = new THREE.Scene();
@@ -3595,6 +4891,8 @@ function createViewer(container, model, callbacks) {
     if (positions && positions.length) {
       geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     }
+    // 每次换几何都要重新挂 dispose 监听（否则现役这块几何永远不会被断言看到）
+    markDisposalOn(geometry);
     target.geometry = geometry;
   }
 
@@ -3769,12 +5067,17 @@ function createViewer(container, model, callbacks) {
 
   function plainMarkers() {
     return markers.map(function (m) {
-      return {
+      var out = {
         subject: m.subject,
         index: m.index,
         point: m.point ? m.point.slice() : null,
         createdAt: m.createdAt,
       };
+      // 草图标记的定位字段：有就带上（跨草图时要靠它区分是哪条草图的哪条折线）
+      if (typeof m.sketchIndex === 'number') out.sketchIndex = m.sketchIndex;
+      if (typeof m.polylineIndex === 'number') out.polylineIndex = m.polylineIndex;
+      if (typeof m.pointIndex === 'number') out.pointIndex = m.pointIndex;
+      return out;
     });
   }
 
@@ -3812,7 +5115,11 @@ function createViewer(container, model, callbacks) {
     invalidate();
   }
 
-  /** 放一个标记点（双击 / 右键「标记此处」共用）。返回写入的标记数据。 */
+  /** 放一个标记点（双击 / 右键「标记此处」共用）。返回写入的标记数据。
+   *  index 必须按 subject 取**对应**的下标（草图的 index 曾是恒 -1 → 标记文本变成「面 #-1」）：
+   *    sketchLine  → 折线下标
+   *    sketchPoint → 端点下标
+   *    sketch      → 草图下标 */
   function addMarker(pick) {
     if (!pick || !pick.point) return null;
     var subject = contextMenuSubjectOf(pick);
@@ -3820,12 +5127,21 @@ function createViewer(container, model, callbacks) {
     if (subject === 'face') index = pick.faceIndex | 0;
     else if (subject === 'edge') index = pick.edgeIndex | 0;
     else if (subject === 'point') index = (pick.pointIndex != null ? pick.pointIndex : pick.vertexIndex) | 0;
+    else if (subject === 'sketchLine') index = pick.polylineIndex | 0;
+    else if (subject === 'sketchPoint') index = pick.pointIndex | 0;
+    else if (subject === 'sketch') index = pick.sketchIndex | 0;
     var marker = {
       subject: subject,
       index: index,
       point: [pick.point.x, pick.point.y, pick.point.z],
       createdAt: Date.now(),
     };
+    // 草图标记额外带上定位信息（跨草图时前两个数字单独看不够；只加不改既有字段）
+    if (subject === 'sketchLine' || subject === 'sketchPoint' || subject === 'sketch') {
+      if (typeof pick.sketchIndex === 'number') marker.sketchIndex = pick.sketchIndex | 0;
+      if (typeof pick.polylineIndex === 'number') marker.polylineIndex = pick.polylineIndex | 0;
+      if (subject === 'sketchPoint' && typeof pick.pointIndex === 'number') marker.pointIndex = pick.pointIndex | 0;
+    }
     markers.push(marker);
     rebuildMarkers();
     if (isFn(cb.onMarkers)) cb.onMarkers(plainMarkers());
@@ -3834,12 +5150,16 @@ function createViewer(container, model, callbacks) {
 
   function setMarkers(list) {
     markers = Array.isArray(list) ? list.map(function (m) {
-      return {
+      var out = {
         subject: m && m.subject ? m.subject : 'face',
         index: m && typeof m.index === 'number' ? m.index : -1,
         point: m && Array.isArray(m.point) ? m.point.slice() : null,
         createdAt: (m && m.createdAt) || 0,
       };
+      if (m && typeof m.sketchIndex === 'number') out.sketchIndex = m.sketchIndex;
+      if (m && typeof m.polylineIndex === 'number') out.polylineIndex = m.polylineIndex;
+      if (m && typeof m.pointIndex === 'number') out.pointIndex = m.pointIndex;
+      return out;
     }) : [];
     rebuildMarkers();
   }
@@ -3852,24 +5172,98 @@ function createViewer(container, model, callbacks) {
 
   /* ---------------- 草图叠加层（只读：不改模型，只说清「模型背后的草图长什么样」） ----------------
    * 渲染：每条草图折线一个 LineSegments（depthTest:false，浮在实体之上），每条草图一个 Sprite 标签。
-   * 拾取优先级：顶点 > 边 > 面 > **草图** > 空白。理由：草图线是浮在实体表面的细线，
-   *   若排在面之前，任何一条画在面上的草图都会「偷走」面选中（用户的高频动作）；
-   *   但空白处（射线没打到实体）又要能点中草图，所以排在空白之前。
+   * 拾取优先级：顶点 > 边 > 面 > **草图端点 > 草图折线 > 整条草图** > 空白。理由：
+   *   草图线是浮在实体表面的细线，若排在面之前，任何一条画在面上的草图都会「偷走」面选中
+   *   （用户的高频动作）；但空白处（射线没打到实体）又要能点中草图。草图内部则点 > 线 > 整条，
+   *   端点是比线更精确的意图。
    * 关闭开关：整个 group 的几何/材质/贴图全部 dispose 并移出场景（见 disposeSketchGroup）。 */
   var sketchGroup = new THREE.Group();
   sketchGroup.name = 'sw3d-sketches';
   sketchGroup.visible = false;
   scene.add(sketchGroup);
-  var sketchEntries = [];      // [{data, line, label, bbox, center, highlighted}]
+  var sketchEntries = [];      // [{data, line, label, bbox, highlighted, positions, segmentIndex, polylines}]
   var sketchVisible = false;
   var hoverSketchIndex = -1;
+  var hoverSketchLineKey = '';   // 悬停到具体折线时的键（'sk:<sk>:<poly>'），空串 = 没悬停到线
   var selectedSketchIndex = -1;
   var currentSketchPayload = null; // 最近一次 setSketches 的数据（「编辑这条草图」里要取 designId）
   var sketchHud = null;        // 悬停尺寸列表（DOM）
   var sketchPanel = null;      // 选中后的「编辑这条草图」面板（DOM）
+  // 草图多选集合（键设计要求见 sketchLineKey / sketchPointKey）：**不是**单值 selectedSketchIndex 的替代
+  var selectedSketchLines = new Set();
+  var selectedSketchPoints = new Set();
+  // 回收的**真实**证据：不是「dispose() 跑到了这里」的布尔标记（那种标记无条件置位，
+  // 注释掉 geometry.dispose() 也照样变 true —— 断言就变成恒真的假测试，M21 实测全绿）。
+  // 这里给几何/材质挂 three.js 自己的 'dispose' 事件：BufferGeometry.dispose() 与
+  // Material.dispose() 唯一做的事就是 dispatchEvent({type:'dispose'})，
+  // 所以「事件到了」⇔「那个对象的 dispose() 真的执行了」。没执行标记就永远不置位。
+  // 标记必须打在**对象自己身上**（不能只用 WeakSet 记住某个引用）：
+  // refreshSketchPickLines 每次都会 setNodeGeometry 换成一个**新的** BufferGeometry，
+  // 只记旧引用的话，节点上现役的那块几何永远不会被跟踪 —— 断言就永远 false。
+  function markDisposalOn(obj) {
+    if (!obj || !isFn(obj.addEventListener) || obj.__sw3dDisposeTracked) return obj;
+    obj.__sw3dDisposeTracked = true;
+    try {
+      obj.addEventListener('dispose', function () { obj.__sw3dDisposed = true; });
+    } catch (e) { /* 老版本 three 没有事件也没关系：断言会退化成 false，宁可红也不要假绿 */ }
+    return obj;
+  }
+  function isGeometryDisposed(node) {
+    return !!(node && node.geometry && node.geometry.__sw3dDisposed === true);
+  }
+  function isMaterialDisposed(node) {
+    return !!(node && node.material && node.material.__sw3dDisposed === true);
+  }
+  // 选中折线的高亮几何：一条独立 LineSegments，只画「所有选中的折线」，颜色 = SKETCH_HOVER_COLOR。
+  // 不靠「整条草图变色」冒充：整条草图变色仍然由 paintSketchEntry 负责（那是悬停/整条选中）。
+  var sketchPickLines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({
+    color: COLORS.sketchPick, transparent: true, opacity: 1, depthTest: false, depthWrite: false,
+  }));
+  markDisposalOn(sketchPickLines.geometry);
+  markDisposalOn(sketchPickLines.material);
+  sketchPickLines.renderOrder = 5;
+  sketchPickLines.frustumCulled = false;
+  sketchPickLines.visible = false;
+  scene.add(sketchPickLines);
+  // 悬停折线的高亮：**另一块**几何 + **另一个**材质 + **另一种颜色**（比选中暗、淡）。
+  // 合成到一块几何里会让「鼠标扫过」和「已选中」在画面上完全一样，用户分不清哪条是选中的。
+  var sketchHoverLines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({
+    color: COLORS.sketchHoverLine, transparent: true, opacity: SKETCH_HOVER_LINE_OPACITY,
+    depthTest: false, depthWrite: false,
+  }));
+  markDisposalOn(sketchHoverLines.geometry);
+  markDisposalOn(sketchHoverLines.material);
+  sketchHoverLines.renderOrder = 4;       // 比选中低一档：同一条线上选中色压住悬停色
+  sketchHoverLines.frustumCulled = false;
+  sketchHoverLines.visible = false;
+  scene.add(sketchHoverLines);
+  // 选中端点的小球：一个 InstancedMesh 太重，这里是逐个 Mesh（最多几百个），共用几何/材质
+  var sketchPointGroup = new THREE.Group();
+  sketchPointGroup.name = 'sw3d-sketch-points';
+  scene.add(sketchPointGroup);
+  var sketchPointGeometry = null;
+  var sketchPointMaterial = null;
 
   var SKETCH_LINE_STYLE = { color: SKETCH_COLOR, opacity: SKETCH_OPACITY };
-  var SKETCH_LINE_STYLE_ON = { color: SKETCH_HOVER_COLOR, opacity: 1 };
+  // 整条草图变色（悬停/整条选中）用的样式：**不能**等于选中色 COLORS.sketchPick。
+  // 否则悬停时整条草图被刷成和「已选中折线」一模一样的 0xffe479，多选高亮直接被淹没
+  // （实测同一草图里 ΔE76(已选中, 未选中)=0.00 —— 用户移动鼠标去右键时根本看不出选了哪几条）。
+  // 这里用「提亮的草图本色」（青绿），既说明「这条草图被指到了」，又不跟选中色撞。
+  var SKETCH_LINE_STYLE_ON = { color: SKETCH_EMPHASIS_COLOR, opacity: 1 };
+
+  function sketchPointGeometryFor() {
+    if (!sketchPointGeometry) sketchPointGeometry = new THREE.SphereGeometry(Math.max(diagonal * 0.0075, 1e-4), 12, 10);
+    return sketchPointGeometry;
+  }
+
+  function sketchPointMaterialFor() {
+    if (!sketchPointMaterial) {
+      sketchPointMaterial = new THREE.MeshBasicMaterial({
+        color: COLORS.sketchPick, depthTest: false, depthWrite: false, transparent: true, opacity: 0.98,
+      });
+    }
+    return sketchPointMaterial;
+  }
 
   function ensureSketchHud() {
     if (sketchHud || disposed) return sketchHud;
@@ -3952,15 +5346,9 @@ function createViewer(container, model, callbacks) {
       'color:#06281e;background:#57d1a8;border:1px solid #57d1a8;border-radius:5px;';
     button.addEventListener('click', function (event) {
       if (event && isFn(event.stopPropagation)) event.stopPropagation();
-      if (isFn(cb.onSketchEdit)) {
-        cb.onSketchEdit(buildSketchEditInstruction({
-          file: cb.sketchFile || '',
-          designId: (currentSketchPayload && currentSketchPayload.designId) ||
-            cb.sketchDesignId || '',
-          sketch: data,
-          note: typeof cb.sketchNote === 'function' ? cb.sketchNote() : (cb.sketchNote || ''),
-        }));
-      }
+      // 与右键「编辑这条草图」走**同一个**生成函数，两处文本永远一致
+      var text = sketchEditInstructionFor(index);
+      if (text && isFn(cb.onSketchEdit)) cb.onSketchEdit(text);
     });
     panel.appendChild(button);
     panel.style.display = 'block';
@@ -4047,10 +5435,24 @@ function createViewer(container, model, callbacks) {
 
   /** 一条草图 → 场景里的 LineSegments + Sprite 标签。
    *  标签锚在「第一条折线的第一个点」上（草图自己会说明它画在哪），再按序号错开高度，
-   *  这样同一位置的几条草图（例如都画在基准面原点的底板草图）标签不会叠成一坨。 */
+   *  这样同一位置的几条草图（例如都画在基准面原点的底板草图）标签不会叠成一坨。
+   *  同时把「段下标 → 折线下标」映射与 positions 一起留在 entry 上：拾取（pickSketchFromRay）
+   *  靠它把 intersection.index 反查回折线，不靠猜。 */
   function buildSketchEntry(sketch, index) {
-    var entry = { data: sketch, line: null, label: null, bbox: sketch && sketch.bbox ? sketch.bbox : null };
+    var polylines = sketch && Array.isArray(sketch.polylines) ? sketch.polylines : [];
+    var entry = {
+      data: sketch,
+      line: null,
+      label: null,
+      bbox: sketch && sketch.bbox ? sketch.bbox : null,
+      polylines: polylines,
+      positions: null,
+      segmentIndex: buildSketchSegmentIndex(polylines),
+      // 端点索引同样随 entry 缓存：否则每次 pointermove 都要把几万个点重新摊平一遍
+      pointIndex: buildSketchPointIndex(polylines),
+    };
     var positions = buildSketchSegmentPositions(sketch && sketch.polylines);
+    entry.positions = positions;
     if (!positions.length) return entry;                 // 只有参数没有坐标的草图：只留数据，不画线
     var geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
@@ -4070,7 +5472,6 @@ function createViewer(container, model, callbacks) {
     if (label) {
       var at = sketchCenterOf(sketch && sketch.bbox);
       var first = null;
-      var polylines = sketch && Array.isArray(sketch.polylines) ? sketch.polylines : [];
       for (var p = 0; p < polylines.length && !first; p += 1) {
         var points = polylines[p] && Array.isArray(polylines[p].points) ? polylines[p].points : [];
         if (points.length) first = points[0];
@@ -4083,6 +5484,116 @@ function createViewer(container, model, callbacks) {
       entry.label = label;
     }
     return entry;
+  }
+
+  /** 一条折线（按段下标区间）的子几何：只画这一条折线，给「选中折线」的高亮用。
+   *  直接从 entry.positions 里按段区间切（buildSketchSegmentIndex 的 startOfPolyline/countOfPolyline
+   *  与 buildSketchSegmentPositions 的写入顺序严格一致），不重新插值。纯计算，不动 scene。 */
+  function sketchPolylinePositions(entry, polylineIndex) {
+    if (!entry || !entry.positions || !entry.positions.length) return null;
+    var index = entry.segmentIndex;
+    if (!index || !index.startOfPolyline) return null;
+    var start = index.startOfPolyline[polylineIndex];
+    var count = index.countOfPolyline[polylineIndex];
+    if (typeof start !== 'number' || !(count > 0)) return null;
+    var from = start * 6;
+    var to = from + count * 6;
+    if (to > entry.positions.length) return null;
+    return entry.positions.slice(from, to);
+  }
+
+  /** 把一批多选键的折线几何合成一个 Float32Array（悬停和选中各用一次）。纯查询。 */
+  function mergeSketchKeys(keys) {
+    var total = 0;
+    var picked = [];
+    keys.forEach(function (key) {
+      var parsed = parseSketchSelectionKey(key);
+      if (!parsed) return;
+      var entry = sketchEntries[parsed.sketchIndex];
+      var positions = sketchPolylinePositions(entry, parsed.polylineIndex);
+      if (positions && positions.length) { picked.push(positions); total += positions.length; }
+    });
+    if (!total) return null;
+    var merged = new Float32Array(total);
+    var cursor = 0;
+    for (var c = 0; c < picked.length; c += 1) {
+      merged.set(picked[c], cursor);
+      cursor += picked[c].length;
+    }
+    return merged;
+  }
+
+  /** 空几何：把节点清成「没有顶点」的状态（只在从非空变空时做，避免悬停抖动的几何抖动）。
+   *  为什么要显式清：只把 visible 置 false、留着旧顶点，会让「高亮几何顶点数」这类
+   *  可观测状态和真实渲染不一致（禁用高亮后顶点数还报 2，断言就会撒谎）。 */
+  function clearSketchHighlightNode(node) {
+    if (!node) return;
+    node.visible = false;
+    var attr = node.geometry && node.geometry.attributes ? node.geometry.attributes.position : null;
+    if (attr && attr.count > 0) setNodeGeometry(node, null);
+  }
+
+  /** **选中**折线的高亮：把所有选中的折线合成一块 LineSegments（亮琥珀、不透明）。
+   *  这条管线是选中折线的唯一入口；悬停走 refreshSketchHoverLines（另一块几何、另一个颜色），
+   *  两者绝不合并 —— 合并后「鼠标扫过」与「已选中」在画面上无法区分。 */
+  function refreshSketchPickLines() {
+    var keys = new Set();
+    selectedSketchLines.forEach(function (key) {
+      var parsed = parseSketchSelectionKey(key);
+      if (parsed && parsed.pointIndex < 0) keys.add(key);
+    });
+    var merged = mergeSketchKeys(keys);
+    if (!merged) {
+      clearSketchHighlightNode(sketchPickLines);
+      invalidate();
+      return;
+    }
+    setNodeGeometry(sketchPickLines, merged);
+    sketchPickLines.visible = true;
+    invalidate();
+  }
+
+  /** **悬停**折线的高亮：只画当前悬停的那一条（暗琥珀、半透明）。与选中高亮分开画。 */
+  function refreshSketchHoverLines() {
+    var keys = new Set();
+    var hover = hoverSketchLineKey ? parseSketchSelectionKey(hoverSketchLineKey) : null;
+    if (hover && hover.pointIndex < 0) keys.add(hoverSketchLineKey);
+    var merged = mergeSketchKeys(keys);
+    if (!merged) {
+      clearSketchHighlightNode(sketchHoverLines);
+      invalidate();
+      return;
+    }
+    setNodeGeometry(sketchHoverLines, merged);
+    sketchHoverLines.visible = true;
+    invalidate();
+  }
+
+  /** 选中端点的小球：按 selectedSketchPoints 逐个重建（最多几百个，重建比增量维护简单可靠）。 */
+  function refreshSketchPointMarkers() {
+    while (sketchPointGroup.children.length > 0) sketchPointGroup.remove(sketchPointGroup.children[0]);
+    if (!selectedSketchPoints.size) {
+      sketchPointGroup.visible = false;
+      invalidate();
+      return;
+    }
+    var geometry = sketchPointGeometryFor();
+    var material = sketchPointMaterialFor();
+    selectedSketchPoints.forEach(function (key) {
+      var parsed = parseSketchSelectionKey(key);
+      if (!parsed || parsed.pointIndex < 0) return;
+      var entry = sketchEntries[parsed.sketchIndex];
+      var line = entry && entry.polylines ? entry.polylines[parsed.polylineIndex] : null;
+      var points = line && Array.isArray(line.points) ? line.points : [];
+      var p = points[parsed.pointIndex];
+      if (!p || p.length < 3) return;
+      var mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(Number(p[0]) || 0, Number(p[1]) || 0, Number(p[2]) || 0);
+      mesh.renderOrder = 6;
+      sketchPointGroup.add(mesh);
+    });
+    sketchPointGroup.visible = sketchPointGroup.children.length > 0;
+    invalidate();
   }
 
   /** 打开/替换草图叠加层（数据来自 GET /sw3d/sketches）。 */
@@ -4108,18 +5619,31 @@ function createViewer(container, model, callbacks) {
     return getSketchState();
   }
 
-  /** 关掉开关：全部 dispose + 移出场景（防内存泄漏）。 */
+  /** 关掉开关：全部 dispose + 移出场景（防内存泄漏）。
+   *  若当时**确实有选择**（草图多选或整条草图/实体），补一次 `cb.onSelect(null)`，
+   *  否则 React 侧右下角的「已选 N 条线…」信息条和卡片会留在屏幕上（画布高亮已经没了，
+   *  「把所选填进对话框」还点得到）—— 这就是「关了草图开关、信息条还挂着」那个缺陷。
+   *  没有选择时不发回调：`setSketches()` 第一行就是 clearSketches，否则每次换草图数据
+   *  都会多刷一次 null（React 会白重渲染）。 */
   function clearSketches() {
+    var hadSelection = selectedSketchLines.size > 0 || selectedSketchPoints.size > 0 ||
+      selectedSketchIndex >= 0;
     var stats = disposeSketchGroup(sketchGroup);
     sketchEntries = [];
     sketchVisible = false;
     sketchGroup.visible = false;
     hoverSketchIndex = -1;
+    hoverSketchLineKey = '';
     selectedSketchIndex = -1;
+    selectedSketchLines.clear();
+    selectedSketchPoints.clear();
+    try { refreshSketchPickLines(); refreshSketchHoverLines(); refreshSketchPointMarkers(); } catch (e) { /* 场景可能已在回收中 */ }
     currentSketchPayload = null;
     hideSketchHud();
     hideSketchPanel();
     if (isFn(cb.onSketches)) cb.onSketches({ count: 0, lines: 0 });
+    // 回收（dispose）时 disposed 已经是 true：React 侧多半在卸载，别再回调它
+    if (hadSelection && !disposed && isFn(cb.onSelect)) cb.onSelect(null);
     invalidate();
     return stats;
   }
@@ -4139,6 +5663,15 @@ function createViewer(container, model, callbacks) {
       groupChildren: sketchGroup.children.length,
       hovered: hoverSketchIndex,
       selected: selectedSketchIndex,
+      // 多选状态（断言用）：条数 + 键的数组（Set 保持插入顺序）
+      selectedLines: selectedSketchLines.size,
+      selectedPoints: selectedSketchPoints.size,
+      lineKeys: Array.from(selectedSketchLines),
+      pointKeys: Array.from(selectedSketchPoints),
+      polylineCounts: sketchEntries.map(function (e) { return e.polylines ? e.polylines.length : 0; }),
+      segmentCounts: sketchEntries.map(function (e) {
+        return e.segmentIndex ? e.segmentIndex.segmentCount : 0;
+      }),
     };
   }
 
@@ -4156,45 +5689,144 @@ function createViewer(container, model, callbacks) {
     return sketchRaycaster;
   }
 
-  /** 射线拾取草图线：返回 {subject:'sketch', sketchIndex, point}。
-   *  用独立的 Raycaster：主拾取（顶点/边/面）的 raycaster 状态一个字节都不改。 */
-  function pickSketchFromRay(clientX, clientY) {
-    if (!sketchVisible || !sketchEntries.length) return null;
+  /** 射线拾取草图几何：一次给出三种候选（**全部**由同一个射线算出来，交给
+   *  pickSubjectByPriority 决定谁赢：草图端点 > 草图折线 > 整条草图）。
+   *    { subject:'sketchLine',  sketchIndex, sketchName, polylineIndex, kind, closed, lengthMm,
+   *      start:[x,y,z], end:[x,y,z], segmentIndex, t, distance, point:Vector3 }
+   *    { subject:'sketchPoint', sketchIndex, sketchName, polylineIndex, pointIndex, position, distance }
+   *    { subject:'sketch',      sketchIndex, … }  整条草图的兜底（点在草图上但没到折线/端点的容差内）
+   *  射线阈值：折线用 diagonal * SKETCH_PICK_RATIO，端点用 diagonal * SKETCH_POINT_PICK_RATIO
+ *  （两个常量都从 __test 导出，且 test/sketch-select.mjs 有一条**行为**测试：把真实射线平移
+ *   到「刚好在半径内 / 刚好在半径外」各打一次，命中必须翻转 —— 只断言常量等于它自己的定义
+ *   是恒真的假测试，改 client.js 里的实际阈值时它不会红）。
+   *  「段下标 → 折线下标」绝对不靠猜：折线搜索走 pickSketchSegmentInPositions + entry.segmentIndex
+   *  （与 buildSketchSegmentPositions 同源的映射表）。 */
+  function pickSketchCandidates(clientX, clientY) {
+    var out = { sketchPoint: null, sketchLine: null, sketch: null };
+    if (!sketchVisible || !sketchEntries.length) return out;
     var ray = sketchRayAt(clientX, clientY);
-    if (!ray) return null;
-    var previousThreshold = ray.params && ray.params.Line ? ray.params.Line.threshold : 0.1;
-    if (ray.params && ray.params.Line) ray.params.Line.threshold = diagonal * SKETCH_PICK_RATIO;
-    var hits = [];
-    try {
-      for (var i = 0; i < sketchEntries.length; i += 1) {
-        var entry = sketchEntries[i];
-        if (!entry || !entry.line) continue;
-        var found = null;
-        try {
-          found = ray.intersectObject(entry.line, false);
-        } catch (e) { found = null; }
-        if (!found || !found.length) continue;
-        for (var j = 0; j < found.length; j += 1) {
-          hits.push({ sketchIndex: i, distance: found[j].distance, point: found[j].point });
+    if (!ray) return out;
+    var origin = [ray.ray.origin.x, ray.ray.origin.y, ray.ray.origin.z];
+    var direction = [ray.ray.direction.x, ray.ray.direction.y, ray.ray.direction.z];
+    var lineThreshold = diagonal * SKETCH_PICK_RATIO;
+    var pointThreshold = diagonal * SKETCH_POINT_PICK_RATIO;
+    var bestPoint = null;
+    var bestLine = null;
+    var bestSketch = null;
+    for (var i = 0; i < sketchEntries.length; i += 1) {
+      var entry = sketchEntries[i];
+      if (!entry) continue;
+      var name = buildSketchLabelText(entry.data);
+      // 1) 端点（点 > 线 的优先级由调用方保证；这里只挑最近的一个端点）
+      //    传 entry.pointIndex（Flat 数组）而不是 entry.polylines：热路径不重建索引、不分配对象。
+      var pointHit = pickSketchPointInPolylines(entry.pointIndex || entry.polylines,
+        origin, direction, pointThreshold);
+      if (pointHit && (!bestPoint || pointHit.distance < bestPoint.distance)) {
+        bestPoint = {
+          subject: 'sketchPoint',
+          sketchIndex: i,
+          sketchName: name,
+          polylineIndex: pointHit.polylineIndex,
+          pointIndex: pointHit.pointIndex,
+          position: pointHit.position,
+          distance: pointHit.distance,
+          point: new THREE.Vector3(pointHit.position[0], pointHit.position[1], pointHit.position[2]),
+        };
+      }
+      // 2) 折线段（用映射表把段下标反查成折线下标）
+      if (entry.line && entry.positions && entry.segmentIndex) {
+        var segmentHit = pickSketchSegmentInPositions(entry.positions, entry.segmentIndex, origin, direction, lineThreshold);
+        if (segmentHit && segmentHit.polylineIndex >= 0 && (!bestLine || segmentHit.distance < bestLine.distance)) {
+          var polyline = entry.polylines[segmentHit.polylineIndex] || {};
+          var ends = sketchPolylineEndpoints(polyline);
+          bestLine = {
+            subject: 'sketchLine',
+            sketchIndex: i,
+            sketchName: name,
+            polylineIndex: segmentHit.polylineIndex,
+            polylineCount: entry.polylines.length,
+            kind: String(polyline.kind || 'line'),
+            kindLabel: sketchKindLabel(polyline.kind),
+            closed: polyline.closed === true,
+            lengthMm: sketchPolylineLengthMm(polyline),
+            start: ends.start,
+            end: ends.end,
+            segmentIndex: segmentHit.segmentIndex,
+            segmentT: segmentHit.segmentT,
+            distance: segmentHit.distance,
+            point: new THREE.Vector3(segmentHit.point[0], segmentHit.point[1], segmentHit.point[2]),
+          };
         }
       }
-    } finally {
-      if (ray.params && ray.params.Line) ray.params.Line.threshold = previousThreshold;
     }
-    if (!hits.length) return null;
-    hits.sort(function (a, b) { return a.distance - b.distance; });
-    var best = hits[0];
-    return {
-      subject: 'sketch',
-      sketchIndex: best.sketchIndex,
-      distance: best.distance,
-      point: best.point ? new THREE.Vector3(best.point.x, best.point.y, best.point.z) : null,
-    };
+    // 3) 整条草图兜底：只在「既没命中端点、也没命中折线」时才算（点到草图上但没到折线容差）。
+    //    这也是一处性能保护：正常点/悬停都命中前两档，就不必再对整个 LineSegments 做一遍射线测试。
+    //    **诚实说明：这一档实际上不可达（防御性死代码）。** 它用的是**同一批几何**、**同一个**
+    //    lineThreshold（ray.params.Line.threshold = lineThreshold），而第 2 档
+    //    pickSketchSegmentInPositions 已经用同一个阈值扫过每一段；所以「第 3 档能命中」必然
+    //    蕴含「第 2 档也命中」，于是 bestLine 非空、这个分支根本不会被进入。
+    //    实测：800×600 画布按 6px 网格采 13400 个点，命中 sketchPoint 21 / sketchLine 69 /
+    //    sketch 0（见 test/sketch-select.mjs 的「整条草图兜底不可达」测试）。
+    //    保留它的理由：pickSubjectByPriority / CONTEXT_MENU_DEFS / select() 里 'sketch' 这一档
+    //    是公开契约（整条草图有自己的「编辑这条草图」面板），未来若放宽折线容差就可能重新可达；
+    //    删掉它会让那些分支失去来源。**不要**把它当成「整条草图可以被点选」的证据。
+    var previousThreshold = ray.params && ray.params.Line ? ray.params.Line.threshold : 0.1;
+    if ((!bestPoint && !bestLine) && ray.params && ray.params.Line) {
+      ray.params.Line.threshold = lineThreshold;
+      try {
+        for (var s = 0; s < sketchEntries.length; s += 1) {
+          var e2 = sketchEntries[s];
+          if (!e2 || !e2.line) continue;
+          var found = null;
+          try { found = ray.intersectObject(e2.line, false); } catch (e) { found = null; }
+          if (!found || !found.length) continue;
+          for (var j = 0; j < found.length; j += 1) {
+            if (!bestSketch || found[j].distance < bestSketch.distance) {
+              bestSketch = {
+                subject: 'sketch',
+                sketchIndex: s,
+                sketchName: buildSketchLabelText(e2.data),
+                distance: found[j].distance,
+                point: found[j].point ? new THREE.Vector3(found[j].point.x, found[j].point.y, found[j].point.z) : null,
+              };
+            }
+          }
+        }
+      } finally {
+        if (ray.params && ray.params.Line) ray.params.Line.threshold = previousThreshold;
+      }
+    }
+    out.sketchPoint = bestPoint;
+    out.sketchLine = bestLine;
+    out.sketch = bestSketch;
+    return out;
   }
 
-  /** 悬停草图：只改强调色 + 尺寸浮层，不动主拾取（面/边/点）的状态。 */
-  function setSketchHover(index) {
+  /** 射线拾取草图：按 草图端点 > 草图折线 > 整条草图 的优先级返回一个 pick（没命中返回 null）。
+   *  兼容旧签名：以前返回 {subject:'sketch'}，现在可能返回 'sketchLine' / 'sketchPoint'。 */
+  function pickSketchFromRay(clientX, clientY) {
+    var candidates = pickSketchCandidates(clientX, clientY);
+    var winner = pickSubjectByPriority(candidates);
+    if (winner === 'sketchPoint') return candidates.sketchPoint;
+    if (winner === 'sketchLine') return candidates.sketchLine;
+    if (winner === 'sketch') return candidates.sketch;
+    return null;
+  }
+
+  /** 悬停草图：只改强调色 + 尺寸浮层，不动主拾取（面/边/点）的状态。
+   *  第二个参数 hit 可选：给了 'sketchLine'/'sketchPoint' 的 pick 就把那条折线单独高亮
+   *  （走 refreshSketchPickLines 的同一条管线），这就让「悬停到哪条线」在视觉上说得清。 */
+  function setSketchHover(index, hit) {
     var next = typeof index === 'number' && index >= 0 && index < sketchEntries.length ? index : -1;
+    var nextLineKey = '';
+    if (next >= 0 && hit && (hit.subject === 'sketchLine' || hit.subject === 'sketchPoint') &&
+      typeof hit.polylineIndex === 'number' && hit.polylineIndex >= 0) {
+      nextLineKey = sketchLineKey(next, hit.polylineIndex);
+    }
+    if (nextLineKey !== hoverSketchLineKey) {
+      hoverSketchLineKey = nextLineKey;
+      try { refreshSketchHoverLines(); } catch (e) { /* 场景回收中 */ }
+    }
     if (next === hoverSketchIndex) {
       if (next >= 0) showSketchHud(next);
       return next;
@@ -4213,7 +5845,209 @@ function createViewer(container, model, callbacks) {
     return next;
   }
 
-  /** 选中草图（面板里带「编辑这条草图」）。 */
+  /** 一条折线的多选数据（卡片/指令文本用）：序号 + 类型 + 长度 + 端点。纯查询，不改状态。 */
+  function sketchLineInfo(sketchIndex, polylineIndex) {
+    var entry = sketchEntries[sketchIndex];
+    if (!entry) return null;
+    var polyline = entry.polylines ? entry.polylines[polylineIndex] : null;
+    if (!polyline) return null;
+    var ends = sketchPolylineEndpoints(polyline);
+    return {
+      sketchIndex: sketchIndex,
+      sketchName: buildSketchLabelText(entry.data),
+      // 基准面：两条**同名**草图只靠名字无法区分，指令文本里要带「第 N 条 / 基准面」
+      sketchPlane: String((entry.data && entry.data.plane) || ''),
+      sketchFeature: String((entry.data && entry.data.feature) || ''),
+      polylineIndex: polylineIndex,
+      kind: String(polyline.kind || 'line'),
+      kindLabel: sketchKindLabel(polyline.kind),
+      closed: polyline.closed === true,
+      lengthMm: sketchPolylineLengthMm(polyline),
+      start: ends.start,
+      end: ends.end,
+      anchor: sketchPolylineAnchor(polyline),
+    };
+  }
+
+  /** 一个草图端点的多选数据。纯查询。 */
+  function sketchPointInfo(sketchIndex, polylineIndex, pointIndex) {
+    var entry = sketchEntries[sketchIndex];
+    if (!entry) return null;
+    var polyline = entry.polylines ? entry.polylines[polylineIndex] : null;
+    var points = polyline && Array.isArray(polyline.points) ? polyline.points : [];
+    var p = points[pointIndex];
+    if (!p || p.length < 3) return null;
+    return {
+      sketchIndex: sketchIndex,
+      sketchName: buildSketchLabelText(entry.data),
+      sketchPlane: String((entry.data && entry.data.plane) || ''),
+      sketchFeature: String((entry.data && entry.data.feature) || ''),
+      polylineIndex: polylineIndex,
+      pointIndex: pointIndex,
+      position: [Number(p[0]) || 0, Number(p[1]) || 0, Number(p[2]) || 0],
+    };
+  }
+
+  /** 多选集合 → 结构化列表（保持插入顺序）：{lines:[…], points:[…], summary, text}。 */
+  function sketchSelectionDetail() {
+    var lines = [];
+    var points = [];
+    selectedSketchLines.forEach(function (key) {
+      var parsed = parseSketchSelectionKey(key);
+      if (!parsed) return;
+      var info = sketchLineInfo(parsed.sketchIndex, parsed.polylineIndex);
+      if (info) lines.push(info);
+    });
+    selectedSketchPoints.forEach(function (key) {
+      var parsed = parseSketchSelectionKey(key);
+      if (!parsed) return;
+      var info = sketchPointInfo(parsed.sketchIndex, parsed.polylineIndex, parsed.pointIndex);
+      if (info) points.push(info);
+    });
+    return {
+      lines: lines,
+      points: points,
+      summary: sketchSelectionSummaryText(lines, points),
+      text: buildSketchSelectionText(lines, points),
+    };
+  }
+
+  /** 多选集合变更后的统一出口：重画高亮 + 报给上层 + 通知主拾取的卡片。
+   *  cb.onSelect 收到 subject:'sketchSelection'（rx 侧据此显示信息条），单条时仍额外带
+   *  单条的 payload，方便旧逻辑照常工作。 */
+  function emitSketchSelection() {
+    try { refreshSketchPickLines(); refreshSketchHoverLines(); refreshSketchPointMarkers(); } catch (e) { /* 场景回收中 */ }
+    var detail = sketchSelectionDetail();
+    if (!detail.lines.length && !detail.points.length) {
+      if (isFn(cb.onSelect)) cb.onSelect(null);
+      invalidate();
+      return detail;
+    }
+    if (isFn(cb.onSelect)) {
+      cb.onSelect({
+        subject: 'sketchSelection',
+        sketchIndex: detail.lines.length ? detail.lines[0].sketchIndex
+          : (detail.points.length ? detail.points[0].sketchIndex : -1),
+        lines: detail.lines,
+        points: detail.points,
+        summary: detail.summary,
+        text: detail.text,
+      });
+    }
+    invalidate();
+    return detail;
+  }
+
+  /** 选中折线/端点的**唯一入口**（点击与 Ctrl 点击都走它）：纯状态机 updateSketchSelection
+   *  决定集合怎么变，然后统一刷新。返回 {detail, pick}。 */
+  function applySketchPick(pick, additive) {
+    var state = updateSketchSelection({ lines: selectedSketchLines, points: selectedSketchPoints }, pick, !!additive);
+    selectedSketchLines = state.lines;
+    selectedSketchPoints = state.points;
+    // 多选集合非空时，整条草图的「面板选中」要让位（否则面板/卡片两套选中打架）
+    if ((selectedSketchLines.size || selectedSketchPoints.size) && selectedSketchIndex >= 0) {
+      selectSketch(-1);
+    }
+    var detail = emitSketchSelection();
+    return { detail: detail, pick: pick || null };
+  }
+
+  /** 清空草图多选（Esc / 点空白 / 选中实体对象时都用它）。 */
+  function clearSketchSelection(options) {
+    var opts = options || {};
+    selectedSketchLines.clear();
+    selectedSketchPoints.clear();
+    if (opts.silent) {
+      try { refreshSketchPickLines(); refreshSketchHoverLines(); refreshSketchPointMarkers(); } catch (e) { /* ignore */ }
+      return;
+    }
+    emitSketchSelection();
+  }
+
+  /** 「全选本草图」：把某条草图的全部折线放进多选集合（入口在右键菜单里，
+   *  见 CONTEXT_MENU_DEFS.sketchLine 的 'select-all'）。不做 Ctrl+A：会跟浏览器/宿主快捷键抢。
+   *  **先清空两类集合**：「全选本草图」的语义是「选择 = 本草图的全部折线」，
+   *  不是「追加」。旧实现只清点、不清线，于是「已选草图 B 的 1 条 → 对草图 A 全选」
+   *  会得到 [B 那条, A 的 0, A 的 1] 三条 —— 信息条还显示「已全选 3 条」，而 A 只有 2 条。 */
+  function selectAllSketchLines(sketchIndex) {
+    var entry = sketchEntries[sketchIndex];
+    if (!entry || !entry.polylines) return { lines: 0, points: 0 };
+    selectedSketchLines.clear();
+    selectedSketchPoints.clear();
+    for (var i = 0; i < entry.polylines.length; i += 1) {
+      if (sketchPolylineSegmentCount(entry.polylines[i]) <= 0) continue;
+      selectedSketchLines.add(sketchLineKey(sketchIndex, i));
+    }
+    if (selectedSketchIndex >= 0) selectSketch(-1);
+    emitSketchSelection();
+    return { lines: selectedSketchLines.size, points: selectedSketchPoints.size };
+  }
+
+  /** 只选中整条草图（不弹面板、不回调）。菜单里的「编辑这条草图」用它把状态摆正，
+   *  真正的指令生成在 showSketchPanel → cb.onSketchEdit。 */
+  function selectWholeSketchStateOnly(index) {
+    var next = typeof index === 'number' && index >= 0 && index < sketchEntries.length ? index : -1;
+    if (selectedSketchIndex >= 0 && selectedSketchIndex !== next) {
+      paintSketchEntry(sketchEntries[selectedSketchIndex], false);
+    }
+    selectedSketchIndex = next;
+    if (next >= 0) paintSketchEntry(sketchEntries[next], true);
+    invalidate();
+    return next;
+  }
+
+  /** 「编辑这条草图」的**唯一**生成入口：把指令文本交给上层（React 填进输入框）。
+   *  为什么需要它：整条草图档（subject:'sketch'）在实际拾取里不可达（见 pickSketchCandidates
+   *  第 3 档的说明），所以 selectSketch() 永远不会被拾取路径调用 → showSketchPanel 里的
+   *  按钮永远没机会被点 → cb.onSketchEdit 成了死代码，用户升级后丢掉「点草图 → 编辑这条草图」
+   *  这条最常用路径。这里把同一个生成逻辑抽出来，由右键菜单的 'edit-sketch' 直接调。
+   *  @returns {string} 生成的指令文本（没有这条草图时返回空串）。 */
+  function sketchEditInstructionFor(sketchIndex) {
+    var entry = sketchEntries[sketchIndex];
+    if (!entry) return '';
+    // cb.sketchNote 是外部嵌入方提供的回调，**可能抛**（React 宿主目前不传，只有外部嵌入方会踩）。
+    // 必须兜住：调用点（面板按钮 / editSketchFromMenu）此时已经摆正选中态、弹出面板，
+    // 异常从这里漏出去会带崩整条生成路径 —— onSketchEdit 拿不到文本，界面停在
+    // 「面板在、选中在、输入框空」的不一致状态。抛了只丢「修改意见」，其余照常生成。
+    var note = cb.sketchNote || '';
+    if (isFn(cb.sketchNote)) {
+      try { note = cb.sketchNote(); } catch (e) { note = ''; }
+    }
+    return buildSketchEditInstruction({
+      file: cb.sketchFile || '',
+      designId: (currentSketchPayload && currentSketchPayload.designId) || cb.sketchDesignId || '',
+      sketch: entry.data,
+      note: note,
+    });
+  }
+
+  /** 右键「编辑这条草图」：摆正选中态 + 弹面板 + 生成指令回调上层。
+   *  @returns {{sketchIndex:number, text:string, panel:boolean}} 断言用（不动模型，纯副作用）。 */
+  function editSketchFromMenu(sketchIndex) {
+    var next = selectWholeSketchStateOnly(sketchIndex);
+    if (next < 0) return { sketchIndex: -1, text: '', panel: false };
+    var text = sketchEditInstructionFor(next);
+    var panelShown = false;
+    try { showSketchPanel(next); panelShown = true; } catch (e) { panelShown = false; }
+    if (isFn(cb.onSelect)) {
+      var entry = sketchEntries[next];
+      cb.onSelect({
+        subject: 'sketch',
+        sketchIndex: next,
+        sketch: entry.data,
+        label: buildSketchLabelText(entry.data),
+        dimensions: (entry.data && entry.data.dimensions) || [],
+      });
+    }
+    if (text && isFn(cb.onSketchEdit)) cb.onSketchEdit(text);
+    invalidate();
+    return { sketchIndex: next, text: text, panel: panelShown };
+  }
+
+  /** 选中整条草图（面板里带「编辑这条草图」）。
+   *  注意：拾取路径（subject:'sketch'）在实践中不可达，所以这个函数的**活入口**是
+   *  右键菜单的 editSketchFromMenu 与「全选本草图」之外的面板逻辑；保留它是因为
+   *  select() 的 'sketch' 分支、面板、外部 API 都还引用它。 */
   function selectSketch(index) {
     var next = typeof index === 'number' && index >= 0 && index < sketchEntries.length ? index : -1;
     if (selectedSketchIndex >= 0 && selectedSketchIndex !== next) paintSketchEntry(sketchEntries[selectedSketchIndex], false);
@@ -4306,16 +6140,56 @@ function createViewer(container, model, callbacks) {
     menuPointKey = null;
   }
 
+  /** pick 是否已经在草图多选集合里（右键菜单要据此决定「动不动选择」）。 */
+  function isPickInSketchSelection(pick) {
+    if (!pick) return false;
+    var subject = String(pick.subject || '');
+    if (subject === 'sketchLine') {
+      return selectedSketchLines.has(sketchLineKey(pick.sketchIndex, pick.polylineIndex));
+    }
+    if (subject === 'sketchPoint') {
+      return selectedSketchPoints.has(sketchPointKey(pick.sketchIndex, pick.polylineIndex, pick.pointIndex));
+    }
+    return false;
+  }
+
+  /** 这个 pick 属于「草图对象」这类（折线 / 端点 / 整条草图）。 */
+  function isSketchPickSubject(pick) {
+    var subject = String((pick && pick.subject) || '');
+    return subject === 'sketchLine' || subject === 'sketchPoint' || subject === 'sketch';
+  }
+
   /**
-   * 弹出右键菜单。对象上 → 对象菜单（并顺带选中它）；空白 → 视角菜单。
+   * 弹出右键菜单。对象上 → 对象菜单；空白 → 视角菜单。
    * 「标记此处」真的放标记点；「添加草图 / 编辑成型草图 / 倒圆角/倒角 / 作为基准 / 设为基准点」
    * 本轮不改模型，而是回调给 React 生成一句可发给模型的指令。
+   * 草图对象上还多两项：「全选本草图」（action，直接把整条草图的折线放进多选集合）与
+   * 「把所选填进对话框」（draft，指令文本见 buildSketchSelectionInstruction），
+   * 以及「编辑这条草图」（draft，走 showSketchPanel → cb.onSketchEdit）。
+   *
+   * **右键不是选择操作，选择留给左键**（这是本函数的硬规则）：
+   *   草图多选集合**非空**时，右键**任何草图对象**（折线/端点/整条草图）都一个字节不动 ——
+   *   包括命中项**不在**集合里的情况。用户「Ctrl 选中 2 条 → 手滑右键旁边那条线 →
+   *   想点『把所选填进对话框』」时，绝对不能把 2 条替换成 1 条（旧实现只保住了
+   *   「命中项已在集合里」这一半，右键未选中项照样把多选摧毁成 1 条）。
+   *   集合为空时才照旧 select(pick)，让「先右键再操作」这条老路径仍然成立。
+   *   右键**实体**对象（面/边/点）不在此规则内：实体选择本来就是单值、且与草图多选互斥，
+   *   照旧走 select(pick)（会清草图多选）—— 那是选中实体，不是「右键草图」。
+   * 菜单项的计数取**动完之后**的集合大小。
    */
   function showContextMenu(clientX, clientY) {
     closeContextMenu();
     var pick = pickAt(clientX, clientY);
-    if (pick) select(pick);
-    var items = contextMenuItemsFor(pick);
+    var hasSketchSelection = selectedSketchLines.size > 0 || selectedSketchPoints.size > 0;
+    if (pick) {
+      // 有草图多选 + 右键的是草图对象 → 完全不动选择；其余情况照旧选中该 pick
+      var keepSelection = hasSketchSelection && isSketchPickSubject(pick);
+      if (!keepSelection) select(pick);
+    }
+    var items = contextMenuItemsFor(pick, {
+      selectedLines: selectedSketchLines.size,
+      selectedPoints: selectedSketchPoints.size,
+    });
     var rect = dom.getBoundingClientRect();
     var menu = doc.createElement('div');
     menu.className = 'sw3d-menu';
@@ -4335,11 +6209,26 @@ function createViewer(container, model, callbacks) {
           event.stopPropagation();
           closeContextMenu();
           if (item.behavior === 'mark') addMarker(pick);
+          // 「全选本草图」在引擎里就把多选集合建好（不依赖 React 侧），随后照常回调
+          if (item.id === 'select-all' && pick && typeof pick.sketchIndex === 'number') {
+            selectAllSketchLines(pick.sketchIndex);
+          }
+          // 「编辑这条草图」：整条草图档在拾取里不可达，这里是它的**活入口**。
+          // 引擎自己摆正选中态 + 弹面板 + 生成指令（文本经 cb.onSketchEdit 交给 React 填框）。
+          var edit = null;
+          if (item.id === 'edit-sketch' && pick && typeof pick.sketchIndex === 'number') {
+            edit = editSketchFromMenu(pick.sketchIndex);
+          }
           if (isFn(cb.onMenuAction)) {
             cb.onMenuAction({
               action: item.id,
               behavior: item.behavior,
               target: pick || null,
+              // 多选快照：React 侧拼「把所选填进对话框」的指令时直接用，不用再问引擎要一次
+              selection: sketchSelectionDetail(),
+              // 「编辑这条草图」生成好的指令文本（null = 这一项不生成指令）
+              instruction: edit && edit.text ? edit.text : null,
+              sketchIndex: edit ? edit.sketchIndex : null,
             });
           }
         });
@@ -4349,7 +6238,7 @@ function createViewer(container, model, callbacks) {
     var hint = doc.createElement('div');
     hint.className = 'sw3d-menu-hint';
     applyInlineStyle(hint, MENU_HINT_STYLE);
-    hint.appendChild(doc.createTextNode('双指点按 = 右键；Shift+F10 也可唤出'));
+    hint.appendChild(doc.createTextNode('双指点按 = 右键；Shift+F10 也可唤出；Ctrl/Cmd+左键 = 多选'));
     menu.appendChild(hint);
     menuPointKey = pickTargetKey(pick);
 
@@ -4401,8 +6290,11 @@ function createViewer(container, model, callbacks) {
     };
   }
 
-  /** 射线拾取，优先级 顶点 > 边 > 面（见 pickSubjectByPriority）。被剖切裁掉的对象不可选：
-   *  顶点按 isPointVisible 过滤，边由 raycastEdgeGrid 的 planeTest 过滤，面由 pickFace 的 planeTest 过滤。 */
+  /** 射线拾取，优先级 顶点 > 边 > 面 > 草图端点 > 草图折线 > 整条草图（见 pickSubjectByPriority）。
+   *  被剖切裁掉的对象不可选：顶点按 isPointVisible 过滤，边由 raycastEdgeGrid 的 planeTest 过滤，
+   *  面由 pickFace 的 planeTest 过滤。
+   *  草图视图（model.sketchOnly，没有任何实体几何）下，实体那三路返回 null，于是草图拾取是唯一的
+   *  命中来源 —— 这就是「草图视图下点得到折线/端点」的实现基础，不需要额外的开关。 */
   function pickAt(clientX, clientY, options) {
     var opts = options || {};
     var rect = dom.getBoundingClientRect();
@@ -4414,14 +6306,24 @@ function createViewer(container, model, callbacks) {
     var vertexHit = opts.skipVertex ? null : pickVertexFromRay();
     var edgeHit = opts.skipEdge ? null : pickEdgeFromRay();
     var faceHit = opts.skipFace ? null : pickFaceFromRay();
-    var winner = pickSubjectByPriority({ vertex: vertexHit, edge: edgeHit, face: faceHit });
+    // 草图候选一次性算出来（端点/折线/整条草图），再和实体三路一起交给同一个优先级函数：
+    // 实体永远赢（草图线不该偷走面的点选），草图内部 端点 > 折线 > 整条。
+    var sketchHits = sketchVisible ? pickSketchCandidates(clientX, clientY)
+      : { sketchPoint: null, sketchLine: null, sketch: null };
+    var winner = pickSubjectByPriority({
+      vertex: vertexHit,
+      edge: edgeHit,
+      face: faceHit,
+      sketchPoint: sketchHits.sketchPoint,
+      sketchLine: sketchHits.sketchLine,
+      sketch: sketchHits.sketch,
+    });
     if (winner === 'vertex') return vertexHit;
     if (winner === 'edge') return edgeHit;
     if (winner === 'face') return faceHit;
-    // 草图排在「面之后、空白之前」：浮在实体表面的细线不该抢走面的点选，
-    // 但射线没打到实体（背景方向）时仍然要能点中草图（然后走「编辑这条草图」）。
-    var sketchHit = pickSketchFromRay(clientX, clientY);
-    if (sketchHit) return sketchHit;
+    if (winner === 'sketchPoint') return sketchHits.sketchPoint;
+    if (winner === 'sketchLine') return sketchHits.sketchLine;
+    if (winner === 'sketch') return sketchHits.sketch;
     return null;
   }
 
@@ -4440,11 +6342,26 @@ function createViewer(container, model, callbacks) {
     return { faceIndex: sampleFaceIndex, samples: samplePoints.slice() };
   }
 
+  /** 当前场景规模（节流判据用；草图侧由 entries 现算，只在 setSketches 后变）。 */
+  function sketchScaleStats() {
+    var points = 0;
+    var segments = 0;
+    for (var i = 0; i < sketchEntries.length; i += 1) {
+      var entry = sketchEntries[i];
+      if (!entry) continue;
+      var index = entry.segmentIndex;
+      segments += index ? index.segmentCount : 0;
+      points += entry.pointIndex ? entry.pointIndex.pointCount : 0;
+    }
+    return { pointCount: points, segmentCount: segments };
+  }
+
   function setHover(clientX, clientY) {
-    // 三角形特别多的模型把 hover 限到 ~30fps，避免拖慢交互（点击仍然即时）
-    var throttle = model.stats && model.stats.triangleCount > HOVER_THROTTLE_TRIANGLES;
-    var now = Date.now();
-    if (throttle && now - lastHoverAt < 33) return;
+    // 规模大的模型把 hover 限到 ~30fps，避免拖慢交互（点击仍然即时）。
+    // 判据同时看三角面数与草图点数/段数：草图视图没有三角面，光看 triangleCount 永不节流。
+    var throttle = hoverThrottleNeeded(model.stats, sketchScaleStats());
+    var now = hoverNow();
+    if (throttle && now - lastHoverAt < HOVER_THROTTLE_MS) return;
     lastHoverAt = now;
     var picked = pickEdgeFromRay();
     var next = picked ? picked.edgeIndex : -1;
@@ -4453,14 +6370,31 @@ function createViewer(container, model, callbacks) {
       hoverEdgeIndex = next;
       refreshHover();
     }
-    // 草图悬停：只在「没有边被命中」且叠加层开着时生效；面/边/点的主拾取状态不动
+    // 草图悬停：只在「没有边被命中」且叠加层开着时生效；面/边/点的主拾取状态不动。
+    // 悬停到具体的折线就只高亮那条折线（hit 带 polylineIndex），否则退化成整条草图变色。
     if (sketchVisible) {
       var sketchHit = picked ? null : pickSketchFromRay(clientX, clientY);
-      setSketchHover(sketchHit ? sketchHit.sketchIndex : -1);
+      setSketchHover(sketchHit ? sketchHit.sketchIndex : -1, sketchHit);
+      if (sketchHit) dom.style.cursor = 'pointer';
     }
   }
 
-  function select(picked) {
+  /**
+   * 选中（**唯一入口**）。picked 为 null = 清空一切（含草图多选）。
+   *   select(pick)                  → 替换选择（不按 Ctrl 的单击，保持原有单选手感）
+   *   select(pick, { additive:true }) → 累积/取消（Ctrl 或 Cmd + 左键，见 updateSketchSelection）
+   * 草图折线 / 草图端点走多选集合（selectedSketchLines / selectedSketchPoints），不塞进单值
+   * selectedSketchIndex；整条草图仍然走 selectSketch（它有自己的「编辑这条草图」面板）。
+   * Ctrl + 点空白（picked 为 null 且 additive）= **什么都不做**：Ctrl 的语义是累积，点空白几乎
+   * 都是手滑；而「清空」必须三处一致（集合 + 高亮 + cb.onSelect(null)），additive 路径做不到。
+   * 旧实现会在这里发 cb.onSelect(null) 却不清集合，于是右下角信息条没了、画布还亮着、
+   * 「把所选填进对话框」还拿得到数据 —— 三处状态互相矛盾。
+   */
+  function select(picked, options) {
+    var opts = options || {};
+    var additive = !!opts.additive;
+    if (additive && !picked) return;      // Ctrl/Cmd + 点空白：不改变任何状态、不发任何回调
+    if (!additive) clearSketchSelection({ silent: true });
     if (!picked) {
       selectedSubject = 'edge';
       selectedEdgeIndex = -1;
@@ -4474,8 +6408,34 @@ function createViewer(container, model, callbacks) {
       invalidate();
       return;
     }
+    if (picked.subject === 'sketchLine' || picked.subject === 'sketchPoint') {
+      // 草图折线 / 草图端点：走多选集合，视觉高亮由 refreshSketchPickLines / refreshSketchPointMarkers
+      // 统一画（单条 LineSegments + 小球），主拾取（面/边/点的单值）全部清空，两套选中不打架。
+      // 注意：这里**不**调 refreshSelection() —— 它会把单选高亮（selectLines/faceMesh）关掉，
+      // 而这条路径本来就没开过它们；反而会把 selectedAnchor 清空，卡片的锚点就丢了。
+      selectedSubject = 'edge';
+      selectedEdgeIndex = -1;
+      selectedFaceIndex = -1;
+      selectedPointIndex = -1;
+      faceMesh.visible = false;
+      selectLines.visible = false;
+      selectLines2.visible = false;
+      if (selectedSketchIndex >= 0) selectSketch(-1);
+      if (picked.subject === 'sketchPoint') {
+        selectedAnchor = picked.position
+          ? new THREE.Vector3(picked.position[0], picked.position[1], picked.position[2])
+          : (picked.point ? picked.point.clone() : null);
+      } else {
+        // 折线的锚点：取命中段的那个点（射线与段的最近点），卡片贴着用户真正点的地方
+        selectedAnchor = picked.point ? picked.point.clone() : null;
+      }
+      applySketchPick(picked, additive);
+      invalidate();
+      return;
+    }
     if (picked.subject === 'sketch') {
-      // 草图选中：清掉面/边/点的高亮，只留草图强调 + 面板（面板里有「编辑这条草图」）
+      // 整条草图选中：清掉面/边/点的高亮 + 草图多选，只留草图强调 + 面板（面板里有「编辑这条草图」）
+      if (!additive) clearSketchSelection({ silent: true });
       selectedSubject = 'sketch';
       selectedEdgeIndex = -1;
       selectedFaceIndex = -1;
@@ -4487,6 +6447,11 @@ function createViewer(container, model, callbacks) {
       invalidate();
       return;
     }
+    // 选中实体对象（面/边/点）：草图的整条选中与多选都让位。
+    // 这里**不**看 additive：Ctrl+点实体仍然是「替换」——实体选择本来就是单值的，
+    // 若留着草图多选，getSelection() 会报 sketchSelection 而卡片却画实体，两套状态打架。
+    // silent：紧接着的各分支会自己 cb.onSelect 一次实体 payload，别先发一个多余的 null。
+    clearSketchSelection({ silent: true });
     if (selectedSketchIndex >= 0) selectSketch(-1);
     if (picked.subject === 'point' || picked.subject === 'vertex') {
       // 点选中：只高亮锚点（小球），边/面高亮全部清掉
@@ -4682,22 +6647,33 @@ function createViewer(container, model, callbacks) {
         lastClick = null;
         return;
       }
+      // Ctrl / Cmd + 左键 = 累积选择（macOS 用 metaKey）。按住 Ctrl 时拖动仍然是旋转：
+      // 只有「没拖动」才会走到这里，所以不会把旋转手势误判成多选。
+      var additive = !!(event && (event.ctrlKey || event.metaKey));
       var picked = pickAt(event.clientX, event.clientY);
       var now = Date.now();
-      var isDouble = lastClick && isDoubleClickGesture(lastClick.pick, picked, now - lastClick.at);
-      if (isDouble) {
-        // 双击：对象上 = 放标记点（保留选中）；空白 = 适配视角并取消选中
+      // Ctrl/Cmd 点击**不参与双击判定**：否则「普通点线 A → 300ms 内 Ctrl 点 A（意图=取消）」
+      // 会因 pickTargetKey 相同被判成双击，走非 additive 分支 → 又选中 A + 凭空多一个标记球。
+      // 同时把 lastClick 清掉：Ctrl 点击不该给双击计时续命，也不该被下一次普通点击当成双击前半。
+      if (additive) {
         lastClick = null;
-        if (picked) {
-          select(picked);
-          addMarker(picked);
-        } else {
-          select(null);
-          fitView();
-        }
+        select(picked, { additive: true });
       } else {
-        select(picked);
-        lastClick = { at: now, pick: picked };
+        var isDouble = lastClick && isDoubleClickGesture(lastClick.pick, picked, now - lastClick.at);
+        if (isDouble) {
+          // 双击：对象上 = 放标记点（保留选中）；空白 = 适配视角并取消选中
+          lastClick = null;
+          if (picked) {
+            select(picked);
+            addMarker(picked);
+          } else {
+            select(null);
+            fitView();
+          }
+        } else {
+          select(picked);
+          lastClick = { at: now, pick: picked };
+        }
       }
     }
     var hoverPicked = pickEdgeFromRay();
@@ -4750,9 +6726,12 @@ function createViewer(container, model, callbacks) {
         closeContextMenu();
         return;
       }
+      // Esc = 清空**全部**选择：实体单值（面/边/点）+ 整条草图 + 草图多选集合
+      clearSketchSelection({ silent: true });
       select(null);
       return;
     }
+    // 删除/退格**不绑**任何破坏性动作（这个查看器是只读的：误按一下不该删掉草图/实体上的任何东西）
     // 触控板/键盘等价入口：Shift+F10 与菜单键都弹右键菜单
     if ((event.key === 'F10' && event.shiftKey) || event.key === 'ContextMenu') {
       event.preventDefault();
@@ -4830,6 +6809,19 @@ function createViewer(container, model, callbacks) {
       // 草图叠加层：几何/材质/贴图全部回收，并清掉两个 HUD DOM（防泄漏）
       try {
         clearSketches();
+        // 草图多选的高亮几何/材质/小球也一起回收（否则反复打开预览会泄漏）。
+        // 这里**不**再置任何「我跑到了」布尔标记：disposed 状态由几何/材质自己的 dispose
+        // 事件决定（见 trackDisposalOf）—— 注释掉下面这行 dispose，断言必须变红。
+        sketchPickLines.geometry.dispose();
+        if (sketchPickLines.material) sketchPickLines.material.dispose();
+        scene.remove(sketchPickLines);
+        sketchHoverLines.geometry.dispose();
+        if (sketchHoverLines.material) sketchHoverLines.material.dispose();
+        scene.remove(sketchHoverLines);
+        while (sketchPointGroup.children.length > 0) sketchPointGroup.remove(sketchPointGroup.children[0]);
+        if (sketchPointGeometry) { sketchPointGeometry.dispose(); sketchPointGeometry = null; }
+        if (sketchPointMaterial) { sketchPointMaterial.dispose(); sketchPointMaterial = null; }
+        scene.remove(sketchPointGroup);
         if (sketchHud && sketchHud.parentNode) sketchHud.parentNode.removeChild(sketchHud);
         if (sketchPanel && sketchPanel.parentNode) sketchPanel.parentNode.removeChild(sketchPanel);
         sketchHud = null;
@@ -4928,6 +6920,17 @@ function createViewer(container, model, callbacks) {
     },
     getEdgeGrid: function () { return edgeGrid; },
     getSelection: function () {
+      // 草图多选优先报（它是「当前选择」里最具体的一层：N 条线 + M 个点）
+      if (selectedSketchLines.size || selectedSketchPoints.size) {
+        var detail = sketchSelectionDetail();
+        return {
+          subject: 'sketchSelection',
+          lines: detail.lines,
+          points: detail.points,
+          summary: detail.summary,
+          text: detail.text,
+        };
+      }
       if (selectedSubject === 'point' && selectedPointIndex >= 0) {
         var corner = cornerSet.corners[selectedPointIndex] || null;
         return {
@@ -4942,11 +6945,95 @@ function createViewer(container, model, callbacks) {
       if (selectedSubject === 'face' && selectedFaceIndex >= 0) {
         return { subject: 'face', faceIndex: selectedFaceIndex, samples: samplePoints.slice() };
       }
+      if (selectedSketchIndex >= 0) return { subject: 'sketch', sketchIndex: selectedSketchIndex };
       if (selectedEdgeIndex >= 0) return { subject: 'edge', edgeIndex: selectedEdgeIndex };
       return null;
     },
+    /* --- 草图多选：纯逻辑入口（离线测试与 React 侧都用这几个） --- */
+    getSketchSelection: sketchSelectionDetail,
+    getSketchSelectionKey: function () { return sketchSelectionDetail().text; },
+    /* 选中/悬停高亮的**几何**状态（离线断言「只高亮那一条折线」用；不参与业务逻辑） */
+    getSketchHighlightState: function () {
+      var attr = sketchPickLines.geometry && sketchPickLines.geometry.attributes
+        ? sketchPickLines.geometry.attributes.position : null;
+      var hoverAttr = sketchHoverLines.geometry && sketchHoverLines.geometry.attributes
+        ? sketchHoverLines.geometry.attributes.position : null;
+      var pickColor = sketchPickLines.material && sketchPickLines.material.color
+        ? sketchPickLines.material.color.getHex() : null;
+      var hoverColor = sketchHoverLines.material && sketchHoverLines.material.color
+        ? sketchHoverLines.material.color.getHex() : null;
+      var inScene = function (node) { return scene.children.indexOf(node) >= 0; };
+      return {
+        visible: sketchPickLines.visible || sketchHoverLines.visible,
+        pickLines: {
+          visible: !!sketchPickLines.visible,
+          vertices: attr ? attr.count : 0,
+          segments: attr ? Math.floor(attr.count / 2) : 0,
+          color: pickColor,
+          opacity: sketchPickLines.material ? sketchPickLines.material.opacity : null,
+          renderOrder: sketchPickLines.renderOrder,
+          inScene: inScene(sketchPickLines),
+          geometryDisposed: isGeometryDisposed(sketchPickLines),
+          materialDisposed: isMaterialDisposed(sketchPickLines),
+          /* 真值：几何/材质上真的收到过 three 的 dispose 事件（不是「dispose() 跑到了这里」） */
+          disposed: isGeometryDisposed(sketchPickLines),
+        },
+        /* 悬停高亮是**另一块**几何（不同颜色/透明度/renderOrder）：
+         * 选中一条、悬停另一条时，两个 color 必须不相等 —— 这就是「悬停 ≠ 选中」的证据。 */
+        hoverLines: {
+          visible: !!sketchHoverLines.visible,
+          vertices: hoverAttr ? hoverAttr.count : 0,
+          segments: hoverAttr ? Math.floor(hoverAttr.count / 2) : 0,
+          color: hoverColor,
+          opacity: sketchHoverLines.material ? sketchHoverLines.material.opacity : null,
+          renderOrder: sketchHoverLines.renderOrder,
+          inScene: inScene(sketchHoverLines),
+          geometryDisposed: isGeometryDisposed(sketchHoverLines),
+          materialDisposed: isMaterialDisposed(sketchHoverLines),
+          disposed: isGeometryDisposed(sketchHoverLines),
+        },
+        pointMarkers: sketchPointGroup.children.length,
+        /* 每条草图**整条 LineSegments** 的当前颜色（悬停/整条选中会被 paintSketchEntry 改）。
+         * 「编辑这条草图」与「悬停 ≠ 选中」两条断言都靠它：整条草图色必须不等于选中覆盖层色。 */
+        sketchEntryColors: sketchEntries.map(function (e) {
+          return e && e.line && e.line.material && e.line.material.color
+            ? e.line.material.color.getHex() : null;
+        }),
+        sketchEntryPainted: sketchEntries.map(function (e) {
+          return !!(e && e.line && e.line.renderOrder === 4);
+        }),
+        hoveredLineKey: hoverSketchLineKey,
+        selectedLineKeys: Array.from(selectedSketchLines),
+        selectedPointKeys: Array.from(selectedSketchPoints),
+      };
+    },
+    getSketchData: function (index) {
+      var entry = sketchEntries[index];
+      return entry ? entry.data : null;
+    },
+    selectAllSketchLines: selectAllSketchLines,
+    clearSketchSelection: function () { clearSketchSelection({}); },
+    applySketchPick: applySketchPick,
+    setSketchMultiSelect: function (lineKeys, pointKeys) {
+      selectedSketchLines = new Set(Array.isArray(lineKeys) ? lineKeys : []);
+      selectedSketchPoints = new Set(Array.isArray(pointKeys) ? pointKeys : []);
+      emitSketchSelection();
+    },
     getCornerSet: function () { return cornerSet; },
     getMarkers: plainMarkers,
+    /* 标记的**渲染**状态（离线断言「草图标记真的画出来了」用；不参与业务逻辑）。
+     * rebuildMarkers 对 subject 不做分支：只要 marker 有合法 point 就给一个球 + 序号标签，
+     * 所以草图折线/端点上的标记和实体上的标记走同一条渲染路径。 */
+    getMarkerRenderState: function () {
+      return {
+        count: markers.length,
+        nodes: markerNodes.length,
+        meshes: markerNodes.filter(function (n) { return !!(n && n.mesh); }).length,
+        labels: markerNodes.filter(function (n) { return !!(n && n.label); }).length,
+        groupChildren: markerGroup.children.length,
+        visibleMeshes: markerNodes.filter(function (n) { return !!(n && n.mesh && n.mesh.visible); }).length,
+      };
+    },
     setMarkers: setMarkers,
     addMarker: addMarker,
     clearMarkers: clearMarkers,
@@ -4964,6 +7051,31 @@ function createViewer(container, model, callbacks) {
         cssWidth: Math.max(1, Math.round(container.clientWidth || width || 1)),
         cssHeight: Math.max(1, Math.round(container.clientHeight || height || 1)),
       };
+    },
+    /**
+     * 截图上的**多选标记**：草图多选集合（N 条折线 + M 个端点）→ 屏幕坐标 + 编号。
+     * 编号**必须**与指令文本的 [1]…[N] 同源（同一个 sketchSelectionNumberedPlan），
+     * 否则「图上 3」和正文「[3]」指的是不同对象，用户/模型都会被误导。
+     * 返回 [{x,y,label:'[1]',visible,number}]；没有多选时返回 []（退回旧的单标记逻辑）。
+     */
+    getSnapshotMarkers: function () {
+      if (disposed) return [];
+      var detail = sketchSelectionDetail();
+      if (!detail.lines.length && !detail.points.length) return [];
+      var plan = sketchSelectionNumberedPlan(detail.lines, detail.points);
+      var rect = null;
+      try { rect = dom.getBoundingClientRect(); } catch (e) { rect = null; }
+      if (!rect || !rect.width || !rect.height) return [];
+      return snapshotMarkersFromPlan(plan, function (point) {
+        // 与 viewer.project 同一套换算（NDC → CSS 像素），只是这里不外抛异常
+        var v = new THREE.Vector3(Number(point[0]) || 0, Number(point[1]) || 0, Number(point[2]) || 0);
+        v.project(camera);
+        return {
+          x: (v.x * 0.5 + 0.5) * rect.width,
+          y: (-v.y * 0.5 + 0.5) * rect.height,
+          z: v.z,
+        };
+      }, isPointVisible);
     },
     /* --- introspection hooks (used by the offline browser harness) --- */
     renderNow: function () { if (disposed) return; renderer.render(scene, camera); positionAnchor(); },
@@ -5031,17 +7143,63 @@ var SW3D_TEST = {
   /* --- 草图叠加层（只读） --- */
   SKETCH_COLOR: SKETCH_COLOR,
   SKETCH_HOVER_COLOR: SKETCH_HOVER_COLOR,
+  SKETCH_HOVER_LINE_COLOR: SKETCH_HOVER_LINE_COLOR,
+  SKETCH_HOVER_LINE_OPACITY: SKETCH_HOVER_LINE_OPACITY,
+  SKETCH_EMPHASIS_COLOR: SKETCH_EMPHASIS_COLOR,
   SKETCH_OPACITY: SKETCH_OPACITY,
   SKETCH_DEFAULT_ON: SKETCH_DEFAULT_ON,
   SKETCH_LABEL_HIDE_RATIO: SKETCH_LABEL_HIDE_RATIO,
   sketchPolylineSegmentCount: sketchPolylineSegmentCount,
   sketchPolylineVertexCount: sketchPolylineVertexCount,
   buildSketchSegmentPositions: buildSketchSegmentPositions,
+  /* --- 草图折线/端点拾取 + Ctrl 多选（纯逻辑；离线测试断言的就是这些） --- */
+  buildSketchSegmentIndex: buildSketchSegmentIndex,
+  buildSketchPointIndex: buildSketchPointIndex,
+  sketchGroupIdentity: sketchGroupIdentity,
+  groupSketchSelectionBySketch: groupSketchSelectionBySketch,
+  sketchSelectionNumberedPlan: sketchSelectionNumberedPlan,
+  numberedEntryTitle: numberedEntryTitle,
+  numberedEntryReference: numberedEntryReference,
+  hoverThrottleNeeded: hoverThrottleNeeded,
+  /* 节流时钟钩子：测试注入假时钟后才能确定性地构造「同一 33ms 窗口」与「窗口已过」，
+   * 否则「把间隔改成 3000ms（悬停彻底卡死）」这种变异杀不掉。传 null 恢复 Date.now()。 */
+  setHoverClock: function (fn) { HOVER_CLOCK_HOOK = isFn(fn) ? fn : null; },
+  /* 端点索引构建计数：断言「热路径没有每次 pointermove 都重建索引」用（M6 变异看它）。 */
+  getSketchPointIndexBuilds: function () { return SKETCH_POINT_INDEX_BUILDS; },
+  resetSketchPointIndexBuilds: function () { SKETCH_POINT_INDEX_BUILDS = 0; },
+  HOVER_THROTTLE_TRIANGLES: HOVER_THROTTLE_TRIANGLES,
+  HOVER_THROTTLE_SKETCH_ITEMS: HOVER_THROTTLE_SKETCH_ITEMS,
+  HOVER_THROTTLE_MS: HOVER_THROTTLE_MS,
+  sketchPolylineLengthMm: sketchPolylineLengthMm,
+  sketchPolylineEndpoints: sketchPolylineEndpoints,
+  sketchPolylineAnchor: sketchPolylineAnchor,
+  pickSketchPointInPolylines: pickSketchPointInPolylines,
+  pickSketchSegmentInPositions: pickSketchSegmentInPositions,
+  sketchLineKey: sketchLineKey,
+  sketchPointKey: sketchPointKey,
+  parseSketchSelectionKey: parseSketchSelectionKey,
+  updateSketchSelection: updateSketchSelection,
+  sketchSelectionCounts: sketchSelectionCounts,
+  sketchSelectionSummaryText: sketchSelectionSummaryText,
+  buildSketchSelectionText: buildSketchSelectionText,
+  buildSketchSelectionInstruction: buildSketchSelectionInstruction,
+  sketchKindLabel: sketchKindLabel,
+  SKETCH_KIND_LABELS: SKETCH_KIND_LABELS,
+  SKETCH_PICK_RATIO: SKETCH_PICK_RATIO,
+  SKETCH_POINT_PICK_RATIO: SKETCH_POINT_PICK_RATIO,
   buildSketchLabelText: buildSketchLabelText,
   sketchDimensionsText: sketchDimensionsText,
   sketchBBoxText: sketchBBoxText,
   sketchPolylineStatsText: sketchPolylineStatsText,
   buildSketchLegendText: buildSketchLegendText,
+  /* --- 草图视图（sketch-only：原生件没有 STEP 时的降级） --- */
+  SKETCH_ONLY_DISABLED: SKETCH_ONLY_DISABLED,
+  sketchPayloadBbox: sketchPayloadBbox,
+  inflateBbox: inflateBbox,
+  buildSketchOnlyModel: buildSketchOnlyModel,
+  buildSketchOnlyNotice: buildSketchOnlyNotice,
+  sketchOnlyDisabledText: sketchOnlyDisabledText,
+  disabledToolButton: disabledToolButton,
   buildSketchEditInstruction: buildSketchEditInstruction,
   disposeSketchGroup: disposeSketchGroup,
   fetchSketches: fetchSketches,
@@ -5069,6 +7227,15 @@ var SW3D_TEST = {
   snapshotPlan: snapshotPlan,
   snapshotSectionText: snapshotSectionText,
   snapshotTimeText: snapshotTimeText,
+  snapshotFooterHeight: snapshotFooterHeight,
+  snapshotLineHeightAt: snapshotLineHeightAt,
+  snapshotBadgeText: snapshotBadgeText,
+  snapshotBadgeOf: snapshotBadgeOf,
+  snapshotMarkerPoints: snapshotMarkerPoints,
+  snapshotMarkersFromPlan: snapshotMarkersFromPlan,
+  drawSnapshotCrosshair: drawSnapshotCrosshair,
+  drawSnapshotMarkerDot: drawSnapshotMarkerDot,
+  drawSnapshotBadge: drawSnapshotBadge,
   composeSnapshot: composeSnapshot,
   encodeSnapshot: encodeSnapshot,
   postSnapshot: postSnapshot,
@@ -5101,6 +7268,7 @@ var SW3D_TEST = {
   closestPointOnSegment: closestPointOnSegment,
   trimMeshCache: trimMeshCache,
   precisionTierOf: precisionTierOf,
+  precisionTierTitle: precisionTierTitle,
   decidePath: decidePath,
   useResourceSnapshot: useResourceSnapshot,
   normalizeResourceMeta: normalizeResourceMeta,
@@ -5152,7 +7320,10 @@ function buildSampleS3DM(absoluteOffsets, options) {
     faceCount: 2,
     edgeCount: 1,
     faceEdgeCount: withFaceEdge ? 2 : 0,
-    precision: { deflectionMm: 0.2, maxTriangles: 300000 },
+    precision: {
+      deflectionMm: PRECISION_TIERS[DEFAULT_PRECISION].deflection,
+      maxTriangles: PRECISION_TIERS[DEFAULT_PRECISION].maxTriangles,
+    },
     buffers: [],
     faces: [
       { index: 0, kind: 'plane', areaMm2: 50, normal: [0, 0, 1], point: [5, 5, 0], radiusMm: null },
@@ -5370,6 +7541,19 @@ var UI = {
     background: 'color-mix(in srgb, #ff6b6b 22%, transparent)',
     whiteSpace: 'nowrap',
   },
+  // 禁用态：明确「灰掉 + 不可点」，配合 title 说明原因（草图视图用）
+  btnDisabled: {
+    padding: '1px 6px',
+    minHeight: '19px',
+    fontSize: '11px',
+    color: 'inherit',
+    cursor: 'not-allowed',
+    border: '1px dashed color-mix(in srgb, currentColor 14%, transparent)',
+    borderRadius: '5px',
+    background: 'transparent',
+    whiteSpace: 'nowrap',
+    opacity: 0.38,
+  },
   iconBtn: {
     border: 'none',
     background: 'transparent',
@@ -5407,6 +7591,41 @@ var UI = {
     whiteSpace: 'nowrap',
     textOverflow: 'ellipsis',
     zIndex: 15,
+  },
+  // 草图多选信息条：右下角一块，明细逐行（线：序号+类型+长度；点：序号+坐标）
+  sketchSelectionBox: {
+    position: 'absolute',
+    right: '10px',
+    bottom: '26px',
+    maxWidth: '72%',
+    maxHeight: '40%',
+    overflow: 'auto',
+    padding: '5px 8px',
+    borderRadius: '7px',
+    fontSize: '11px',
+    lineHeight: '1.45',
+    border: '1px solid color-mix(in srgb, #ffe479 55%, transparent)',
+    background: 'color-mix(in srgb, currentColor 12%, transparent)',
+    backdropFilter: 'blur(8px)',
+    zIndex: 19,
+    pointerEvents: 'auto',
+    fontVariantNumeric: 'tabular-nums',
+  },
+  sketchSelectionHead: {
+    fontWeight: 600,
+    marginBottom: '2px',
+    whiteSpace: 'normal',
+  },
+  sketchSelectionList: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '1px',
+    opacity: 0.9,
+  },
+  sketchSelectionRow: {
+    fontSize: '11px',
+    lineHeight: '1.45',
+    whiteSpace: 'nowrap',
   },
   overlay: {
     position: 'absolute',
@@ -5599,6 +7818,19 @@ function toolButton(label, active, onClick, title) {
   }, label);
 }
 
+/** 草图视图专用：禁用态按钮（灰掉 + title 说明为什么不能用 + 点击也不触发）。
+ *  存在的理由：草图视图下剖切/封盖/精度/着色这些依赖实体几何的按钮必须**显式禁用**，
+ *  不能留着让用户点了一脸茫然（点下去 handler 会改状态，但画面上什么都不会变）。 */
+function disabledToolButton(label, active, onClick, disabled, title) {
+  if (!disabled) return toolButton(label, active, onClick, title);
+  return h('button', {
+    type: 'button',
+    title: (title || label) + '（草图视图：没有实体，不可用）',
+    disabled: true,
+    style: UI.btnDisabled,
+  }, label);
+}
+
 /* ------------------------------------------------------------------ */
 /* preview body                                                        */
 /* ------------------------------------------------------------------ */
@@ -5630,6 +7862,10 @@ function ViewerBody(props) {
   var sketchPayload = sketchPayloadHook[0], setSketchPayload = sketchPayloadHook[1];
   var sketchLoadingHook = React.useState(false);
   var sketchLoading = sketchLoadingHook[0], setSketchLoading = sketchLoadingHook[1];
+  // 草图视图：模型只有草图、没有实体（resolve 返回 meshSource:'sketch-only'）。
+  // true 时所有依赖实体几何的按钮都要显式禁用并给出原因。
+  var sketchOnlyHook = React.useState(false);
+  var isSketchOnly = sketchOnlyHook[0], setIsSketchOnly = sketchOnlyHook[1];
   var wireframeHook = React.useState(false);
   var wireframe = wireframeHook[0], setWireframe = wireframeHook[1];
   var edgesHook = React.useState(true);
@@ -5771,6 +8007,8 @@ function ViewerBody(props) {
     setSampleFace(-1);
     setHandoff(null);
     setAnnotationCount(0);
+    // 换文件/重试时先复位：否则上一份草图视图会让新加载的实体模型也带着禁用态
+    setIsSketchOnly(false);
 
     loadModelData(absPath, {
       fileName: fileName,
@@ -5784,6 +8022,9 @@ function ViewerBody(props) {
       if (cancelled || !model) return;
       modelRef.current = model;
       setStats(model.stats);
+      // 草图视图：模型里只有草图，没有面/边/三角形。所有依赖实体几何的能力都要显式禁用
+      var isSketchOnly = !!(model && model.sketchOnly);
+      setIsSketchOnly(isSketchOnly);
       engine = createViewer(canvasRef.current, model, {
         onSelect: function (sel) {
           if (cancelled) return;
@@ -5832,22 +8073,37 @@ function ViewerBody(props) {
         if (ui.sketchOn && ui.sketchPayload && isFn(engine.setSketches)) engine.setSketches(ui.sketchPayload);
       } catch (e) { /* 草图叠加层是可选增强，失败不影响模型查看 */ }
       setLoadState({ phase: 'ready', message: '', detail: '' });
-      if (model.stats.triangleCount > LARGE_MODEL_TRIANGLES) {
+      if (isSketchOnly) {
+        // 自动打开草图叠加层，并用草图包围盒适配相机（bbox 已经在 buildSketchOnlyModel 里
+        // 从草图坐标算出来了，不会退化成 1mm 小盒）。
+        setSketchOn(true);
+        setSketchPayload(model.sketch || null);
+        try {
+          if (isFn(engine.setSketches) && model.sketch) engine.setSketches(model.sketch);
+          engine.fit();
+        } catch (e) { /* 叠加层是可选增强，失败也不该把面板打崩 */ }
+        setNotice(buildSketchOnlyNotice(model));
+      } else if (model.stats.triangleCount > LARGE_MODEL_TRIANGLES) {
         setNotice('三角面过多（' + model.stats.triangleCount + '），已降精度；可点「低」精度档重新生成');
       } else if (model.warnings && model.warnings.length) {
         // 宿主侧的提示（例如「三角形数超过上限，挠度放大后重算」）照原样带出来
         setNotice(String(model.warnings[0]));
       }
-      var version = 's3dm:' + model.stats.triangleCount;
+      var version = (isSketchOnly ? 'sketch:' : 's3dm:') + (isSketchOnly
+        ? String((model.stats && model.stats.polylineCount) || 0)
+        : model.stats.triangleCount);
       if (loadedRef.current !== version + '@' + absPath) {
         loadedRef.current = version + '@' + absPath;
         try { if (content && isFn(content.loaded)) content.loaded(version); } catch (e) { /* ignore */ }
       }
-      postAnnotation({ op: 'list', path: absPath }).then(function (res) {
-        if (cancelled || !res || res.ok !== true) return;
-        setAnnotated(extractAnnotationIndexes(res.items));
-        setAnnotationCount(Array.isArray(res.items) ? res.items.length : 0);
-      }).catch(function () { /* annotations are optional */ });
+      // 草图视图没有实体几何，标注/交接单这些挂在面/边上的能力都不适用：不再去拉标注
+      if (!isSketchOnly) {
+        postAnnotation({ op: 'list', path: absPath }).then(function (res) {
+          if (cancelled || !res || res.ok !== true) return;
+          setAnnotated(extractAnnotationIndexes(res.items));
+          setAnnotationCount(Array.isArray(res.items) ? res.items.length : 0);
+        }).catch(function () { /* annotations are optional */ });
+      }
     }).catch(function (e) {
       clearHardTimer();
       if (cancelled) return;
@@ -5855,9 +8111,16 @@ function ViewerBody(props) {
       var hint = (e && e.hint) || '';
       var code = (e && e.code) || 'LOAD_FAILED';
       if (code === 'NO_MESH_SOURCE') {
-        hint = (hint ? hint + '\n' : '') + '也可以先让 agent 执行 deliver 导出 STEP，再回来查看 3D。';
+        // 旧文案只会把人推去「导出 STEP」，对零实体件是死循环。现在分两种情况说清：
+        //  - 有非草图特征（拉伸/切除…）：先 build 出实体再 deliver，deliver 才可能成功；
+        //  - 只有草图：永远导不出 STEP 几何，唯一出路是先把它拉成实体。
+        hint = (hint ? hint + '\n' : '') +
+          '想看到实体：先在 SOLIDWORKS 里把草图拉伸成实体，再让 agent 执行 deliver 导出 STEP。\n' +
+          '如果这个设计本来就只有草图（零实体），它永远导不出 STEP 几何 —— 反复 deliver 不会有结果。';
       }
-      if (!hint) hint = '可以点击「重试」；若仍然失败，请先让 agent 执行 deliver 导出 STEP。';
+      if (!hint) {
+        hint = '可以点击「重试」；若仍然失败，先确认文件本身是否完整（原生件需要同目录同名 STEP，或先导出 STEP）。';
+      }
       fail(message, hint, code);
     });
     return function () {
@@ -5923,6 +8186,12 @@ function ViewerBody(props) {
       }
       setSketchPayload(payload);
       var warningCount = Array.isArray(payload.warnings) ? payload.warnings.length : 0;
+      // 草图视图：这条提示必须说清「没有实体」以及哪些能力不可用（不能只说「草图 N 条」）
+      if (isSketchOnly) {
+        setNotice(buildSketchOnlyNotice(modelRef.current) +
+          (warningCount ? ' · ' + warningCount + ' 条提示' : ''));
+        return;
+      }
       setNotice(buildSketchLegendText(payload) + (warningCount ? ' · ' + warningCount + ' 条提示' : '') +
         '（只读展示；改草图要等 sw-mcp 支持编辑成型草图）');
     }).catch(function (error) {
@@ -5933,7 +8202,7 @@ function ViewerBody(props) {
     });
     return function () { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sketchOn, absPath]);
+  }, [sketchOn, absPath, isSketchOnly]);
 
   React.useEffect(function () {
     var engine = engineRef.current;
@@ -5969,6 +8238,13 @@ function ViewerBody(props) {
   function currentSummary() {
     var model = modelRef.current;
     if (!model || !selection) return null;
+    // 选中草图不是「边」也不是「面」：草图自己的信息面板由 engine.showSketchPanel 负责
+    // （里面有尺寸/几何/「编辑这条草图」）。这里若落进下面的 edge 分支，会弹出一张
+    // 「边 #undefined」的空卡片 —— 草图视图下面/边/点全都为空，更会变成天书。
+    if (selection.subject === 'sketch') return null;
+    // 草图多选（几条折线 + 几个端点）也不是「边/面/点」：它有自己的一块信息条
+    // （见 sketchSelectionBar / buildSketchSelectionText），不走标注卡片的模板。
+    if (selection.subject === 'sketchSelection') return null;
     var summary;
     if (selection.subject === 'point' &&
       typeof selection.pointIndex === 'number') {
@@ -6020,6 +8296,7 @@ function ViewerBody(props) {
       section: section,
       precision: precision,
       cap: capEnabled,
+      sketchOnly: isSketchOnly,
       at: Date.now(),
     });
   }
@@ -6030,14 +8307,29 @@ function ViewerBody(props) {
   }
 
   /**
-   * 拍一张「当前视角」：渲染 → 合成信息带 → 编码 → 通道 A（失败自动降级通道 B）。
+   * 拍一张「当前视角」：渲染 → 合成信息带 + 多选编号标记 → 编码 → 通道 A（失败自动降级通道 B）。
    * 绝不 throw；最差返回 {ok:false, channel:'none'}，调用方照常填文本。
    */
   function captureShot(options) {
     var opts = options || {};
+    var engine = engineRef.current;
+    // 多选标记：拿得到就全部标出并编号（与文本 [1]…[N] 同源），拿不到就空数组退回旧逻辑
+    var markers = [];
+    try {
+      if (engine && isFn(engine.getSnapshotMarkers)) markers = engine.getSnapshotMarkers() || [];
+    } catch (e) { markers = []; }
+    var badge = '';
+    try {
+      if (markers.length) {
+        var visibleMarkers = markers.filter(function (m) { return m && m.visible !== false; });
+        badge = snapshotBadgeOf('', visibleMarkers.length);
+      }
+    } catch (e2) { badge = ''; }
     return runSnapshotFlow({
-      engine: engineRef.current,
+      engine: engine,
       lines: snapshotLines(),
+      markers: markers,
+      badge: badge,
       filePath: absPath,
       name: shotName(),
       props: props,
@@ -6088,6 +8380,13 @@ function ViewerBody(props) {
       setNotice('已适配视角');
       return;
     }
+    if (action === 'select-all') {
+      // 引擎在菜单点击里已经把多选集合建好了，这里只报一句（含条数与合计长度）
+      var all = (payload && payload.selection) || null;
+      setNotice('已全选本草图的 ' + ((all && all.lines && all.lines.length) || 0) + ' 条折线' +
+        (all && all.summary ? '：' + all.summary : ''));
+      return;
+    }
     if (action === 'reset-view') {
       setView('iso');
       if (engineRef.current) {
@@ -6095,6 +8394,41 @@ function ViewerBody(props) {
         engineRef.current.fit();
       }
       setNotice('已重置为等轴测视角');
+      return;
+    }
+    // 「编辑这条草图」：引擎已在菜单点击里摆正选中态、弹面板并生成指令，
+    // 指令文本随 payload.instruction 一起来（引擎也会单独经 cb.onSketchEdit 交一次）。
+    // 这里兜底：若 payload 没带文本（例如从别处触发），自己再生成一次，绝不静默。
+    if (action === 'edit-sketch' && payload && payload.target &&
+      typeof payload.target.sketchIndex === 'number') {
+      var editSketchIndex = payload.target.sketchIndex;
+      var editText = payload.instruction || '';
+      if (!editText) {
+        var editdata = null;
+        try {
+          if (engineRef.current && isFn(engineRef.current.getSketchData)) {
+            editdata = engineRef.current.getSketchData(editSketchIndex);
+          }
+        } catch (e) { editdata = null; }
+        if (editdata) {
+          editText = buildSketchEditInstruction({
+            file: absPath,
+            designId: (info && info.designId) || ((sketchPayload || {}).designId) || '',
+            sketch: editdata,
+            note: typeof note === 'string' ? note : '',
+          });
+        }
+      }
+      if (!editText) {
+        setNotice('没有取到这条草图的几何数据，无法生成编辑指令');
+        return;
+      }
+      if (setDraftText(editText)) {
+        setNotice('已生成「编辑这条草图」指令并填入输入框，补完修改意见后按回车');
+      } else {
+        copyText(editText);
+        setNotice('已生成「编辑这条草图」指令并复制到剪贴板');
+      }
       return;
     }
     if (action === 'copy-shot') {
@@ -6113,18 +8447,53 @@ function ViewerBody(props) {
       });
       return;
     }
+    // 「把所选填进对话框」：草图多选专用（N 条折线 + M 个端点 + 合计长度），逐字符可断言
+    if (action === 'sketch-fill' || (selection && selection.subject === 'sketchSelection')) {
+      var detail = (payload && payload.selection) ||
+        (selection && selection.subject === 'sketchSelection' ? selection : null) ||
+        (engineRef.current && isFn(engineRef.current.getSketchSelection)
+          ? engineRef.current.getSketchSelection() : null);
+      if (!detail || (!(detail.lines || []).length && !(detail.points || []).length)) {
+        setNotice('还没有选中草图折线/端点：点一条草图线，Ctrl/Cmd+左键 可多选');
+        return;
+      }
+      var sketchData = null;
+      try {
+        var firstSketchIndex = detail.lines && detail.lines.length ? detail.lines[0].sketchIndex
+          : (detail.points && detail.points.length ? detail.points[0].sketchIndex : -1);
+        if (firstSketchIndex >= 0 && engineRef.current && isFn(engineRef.current.getSketchData)) {
+          sketchData = engineRef.current.getSketchData(firstSketchIndex);
+        }
+      } catch (e) { sketchData = null; }
+      var instruction = buildSketchSelectionInstruction({
+        file: absPath,
+        designId: (info && info.designId) || '',
+        sketch: sketchData || { name: (detail.lines[0] && detail.lines[0].sketchName) || 'Sketch' },
+        lines: detail.lines || [],
+        points: detail.points || [],
+        note: typeof note === 'string' ? note : '',
+      });
+      if (setDraftText(instruction)) {
+        setNotice('已把所选的 ' + (detail.lines || []).length + ' 条线、' +
+          (detail.points || []).length + ' 个点填进输入框，补完想法后按回车');
+      } else {
+        copyText(instruction);
+        setNotice('已把所选草图折线/端点复制到剪贴板');
+      }
+      return;
+    }
     // 其余都是「生成指令」类：用当前选中对象的摘要拼一句可发给模型的话
     var summary = currentSummary();
-    var instruction = buildSketchInstruction({
+    var instruction2 = buildSketchInstruction({
       action: action,
       file: absPath,
       summary: summary,
       samples: summary && summary.samples ? summary.samples : [],
     });
-    if (setDraftText(instruction)) {
+    if (setDraftText(instruction2)) {
       setNotice('已生成指令并填入输入框，补完你的意图后按回车');
     } else {
-      copyText(instruction);
+      copyText(instruction2);
       setNotice('已生成指令并复制到剪贴板');
     }
   }
@@ -6381,60 +8750,65 @@ function ViewerBody(props) {
     h('div', { style: UI.sep }),
     h('div', { style: UI.group },
       toolButton('适配', false, function () { if (engineRef.current) engineRef.current.fit(); }, '适配视图（双击画布同样生效）'),
-      toolButton(wireframe ? '线框' : '着色', wireframe, function () { setWireframe(!wireframe); }, '着色 / 线框切换'),
-      toolButton('边线', edgesVisible, function () { setEdgesVisible(!edgesVisible); }, '显示 / 隐藏 B-rep 边线')
+      disabledToolButton(wireframe ? '线框' : '着色', wireframe, function () { setWireframe(!wireframe); }, isSketchOnly, '着色 / 线框切换'),
+      disabledToolButton('边线', edgesVisible, function () { setEdgesVisible(!edgesVisible); }, isSketchOnly, '显示 / 隐藏 B-rep 边线')
     ),
     h('div', { style: UI.sep }),
     h('div', { style: UI.group },
       toolButton('草图', sketchOn, function () { setSketchOn(!sketchOn); },
-        '草图叠加层：只读显示模型背后的草图（数据来自 sw-mcp 的 design 记录），不改模型'),
+        isSketchOnly
+          ? '草图叠加层：这是草图视图本身（没有实体）。关掉会看到空画布'
+          : '草图叠加层：只读显示模型背后的草图（数据来自 sw-mcp 的 design 记录），不改模型'),
       h('span', {
         style: UI.sectionLabel,
         className: 'sw3d-sketch-legend',
-        title: sketchOn && sketchPayload && sketchPayload.ok
-          ? '设计：' + (sketchPayload.designTitle || sketchPayload.designId || '') + ' · 单位 ' + (sketchPayload.unit || 'mm')
-          : '草图叠加层关闭中',
+        title: isSketchOnly
+          ? '当前是草图视图：只显示草图轮廓，没有实体'
+          : (sketchOn && sketchPayload && sketchPayload.ok
+            ? '设计：' + (sketchPayload.designTitle || sketchPayload.designId || '') + ' · 单位 ' + (sketchPayload.unit || 'mm')
+            : '草图叠加层关闭中'),
       }, sketchOn ? (sketchLoading ? '草图 …' : buildSketchLegendText(sketchPayload)) : '草图 关')
     ),
     h('div', { style: UI.sep }),
     h('div', { style: UI.group },
-      toolButton('剖切', section.enabled, function () {
+      disabledToolButton('剖切', section.enabled, function () {
         setSection({ axis: section.axis, t: section.t, enabled: !section.enabled, flip: section.flip });
-      }, '开启 / 关闭剖视图'),
-      toolButton('X', section.enabled && section.axis === 'x', function () {
+      }, isSketchOnly, '开启 / 关闭剖视图'),
+      disabledToolButton('X', section.enabled && section.axis === 'x', function () {
         setSection({ axis: 'x', t: section.t, enabled: true, flip: section.flip });
-      }, '沿 X 轴剖切'),
-      toolButton('Y', section.enabled && section.axis === 'y', function () {
+      }, isSketchOnly, '沿 X 轴剖切'),
+      disabledToolButton('Y', section.enabled && section.axis === 'y', function () {
         setSection({ axis: 'y', t: section.t, enabled: true, flip: section.flip });
-      }, '沿 Y 轴剖切'),
-      toolButton('Z', section.enabled && section.axis === 'z', function () {
+      }, isSketchOnly, '沿 Y 轴剖切'),
+      disabledToolButton('Z', section.enabled && section.axis === 'z', function () {
         setSection({ axis: 'z', t: section.t, enabled: true, flip: section.flip });
-      }, '沿 Z 轴剖切'),
-      toolButton('翻转', section.flip, function () {
+      }, isSketchOnly, '沿 Z 轴剖切'),
+      disabledToolButton('翻转', section.flip, function () {
         setSection({ axis: section.axis, t: section.t, enabled: section.enabled, flip: !section.flip });
-      }, '翻转剖切方向'),
-      toolButton('封盖', capEnabled, function () { setCapEnabled(!capEnabled); }, '剖切封盖：把断面画成实心，避免看起来像空壳'),
+      }, isSketchOnly, '翻转剖切方向'),
+      disabledToolButton('封盖', capEnabled, function () { setCapEnabled(!capEnabled); }, isSketchOnly, '剖切封盖：把断面画成实心，避免看起来像空壳'),
       h('input', {
         type: 'range',
         min: 0,
         max: 100,
         step: 1,
         value: section.t,
-        disabled: !section.enabled,
+        disabled: isSketchOnly || !section.enabled,
         style: UI.range,
-        title: '剖切位置',
+        title: isSketchOnly ? '草图视图没有实体可剖切' : '剖切位置',
         onChange: function (event) {
+          if (isSketchOnly) return;
           setSection({ axis: section.axis, t: Number(event.target.value), enabled: true, flip: section.flip });
         },
       }),
-      h('span', { style: UI.sectionLabel }, sectionIndicator)
+      h('span', { style: UI.sectionLabel }, isSketchOnly ? '剖切不可用（无实体）' : sectionIndicator)
     ),
     h('div', { style: UI.sep }),
     h('div', { style: UI.group },
       h('span', { style: UI.sectionLabel }, '精度'),
-      toolButton('高', precision === 'high', function () { setPrecisionTier('high'); }, '高精度（deflaction 0.1，三角形上限 90 万）'),
-      toolButton('中', precision === 'mid', function () { setPrecisionTier('mid'); }, '中精度（deflaction 0.2，三角形上限 30 万）'),
-      toolButton('低', precision === 'low', function () { setPrecisionTier('low'); }, '低精度（deflaction 0.5，三角形上限 12 万）')
+      disabledToolButton('高', precision === 'high', function () { setPrecisionTier('high'); }, isSketchOnly, precisionTierTitle('high')),
+      disabledToolButton('中', precision === 'mid', function () { setPrecisionTier('mid'); }, isSketchOnly, precisionTierTitle('mid')),
+      disabledToolButton('低', precision === 'low', function () { setPrecisionTier('low'); }, isSketchOnly, precisionTierTitle('low'))
     )
   );
 
@@ -6563,12 +8937,46 @@ function ViewerBody(props) {
   var statusBar = null;
   if (loadState.phase === 'ready') {
     var precisionLabel = (PRECISION_TIERS[precision] && PRECISION_TIERS[precision].label) || precision;
+    // 草图视图不报「三角形 0 · 面 0 · 边 0」（那看着像解析失败），改报草图/折线数
     statusBar = h('div', { style: UI.statusBar },
       h('span', null, fileName),
-      stats ? h('span', null, '· 三角形 ' + stats.triangleCount + ' · 面 ' + stats.faceCount + ' · 边 ' + stats.edgeCount) : null,
-      h('span', null, '· 精度 ' + precisionLabel),
+      isSketchOnly
+        ? h('span', null, '· 草图视图：草图 ' + ((stats && stats.sketchCount) || 0) +
+            ' 条 · 折线 ' + ((stats && stats.polylineCount) || 0) + ' 条 · 无实体')
+        : (stats ? h('span', null, '· 三角形 ' + stats.triangleCount + ' · 面 ' + stats.faceCount + ' · 边 ' + stats.edgeCount) : null),
+      isSketchOnly ? null : h('span', null, '· 精度 ' + precisionLabel),
       info && info.cached && info.cached.hit ? h('span', null, '· 缓存命中') : null,
       annotationCount ? h('span', null, '· 标注 ' + annotationCount) : null
+    );
+  }
+
+  /* ---- 草图多选信息条（已选 N 条线、M 个点 + 合计长度 + 每条/每点的关键数据） ---- */
+  var sketchSelectionBar = null;
+  if (selection && selection.subject === 'sketchSelection') {
+    var selLines = Array.isArray(selection.lines) ? selection.lines : [];
+    var selPoints = Array.isArray(selection.points) ? selection.points : [];
+    var selRows = [];
+    for (var sl = 0; sl < selLines.length; sl += 1) {
+      var selLine = selLines[sl] || {};
+      selRows.push(h('div', { style: UI.sketchSelectionRow, className: 'sw3d-sketch-sel-line' },
+        '线 #' + (selLine.polylineIndex | 0) + '（' + (selLine.kindLabel || sketchKindLabel(selLine.kind)) +
+        '，长 ' + (typeof selLine.lengthMm === 'number' ? selLine.lengthMm.toFixed(1) : '—') + ' mm' +
+        (selLine.closed ? '，闭合' : '') + '）'));
+    }
+    for (var sp = 0; sp < selPoints.length; sp += 1) {
+      var selPoint = selPoints[sp] || {};
+      selRows.push(h('div', { style: UI.sketchSelectionRow, className: 'sw3d-sketch-sel-point' },
+        '点 折线#' + (selPoint.polylineIndex | 0) + ' 点#' + (selPoint.pointIndex | 0) +
+        ' @ ' + fmtPoint(selPoint.position)));
+    }
+    sketchSelectionBar = h('div', {
+      className: 'sw3d-sketch-selection',
+      style: UI.sketchSelectionBox,
+    },
+      h('div', { style: UI.sketchSelectionHead, className: 'sw3d-sketch-sel-summary' },
+        sketchSelectionSummaryText(selLines, selPoints) +
+        ' · Ctrl/Cmd+左键 追加/取消，Esc 清空'),
+      h('div', { style: UI.sketchSelectionList }, selRows)
     );
   }
 
@@ -6626,6 +9034,7 @@ function ViewerBody(props) {
     h('div', { ref: canvasRef, style: UI.canvasHost, className: 'sw3d-canvas-host' }),
     loadState.phase !== 'error' ? toolbar : null,
     card,
+    sketchSelectionBar,
     statusBar,
     overlay
   );

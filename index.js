@@ -1,5 +1,5 @@
 /**
- * @local/dsh-sw-3d-preview —— Host 半边。
+ * dsh-sw-3d-preview —— Host 半边。
  *
  * 给 DSH 文件预览面板里的 3D 成果提供网格数据：
  *   GET  /sw3d/ping        健康检查（python/OCP、缓存目录、three.cjs 是否就位）
@@ -12,6 +12,12 @@
  * - 每个路由自己做信任栅栏（ctx.connection.requestRejection）与方法校验；
  * - 失败只回约定字段（{ok:false,code,message,hint}），不反射任意文件内容，不泄漏堆栈；
  * - 只读写自己的缓存/标注目录（%LOCALAPPDATA%\sw-3d-preview），不修改被预览的原始文件。
+ *
+ * 外部进程访问（可选，默认关闭）：
+ *   信任栅栏只认浏览器那套 cookie/来源凭据，外部进程（Codex CLI、curl、脚本）拿不到。
+ *   配置 extToken 后，栅栏**失败**时再尝试 `Authorization: Bearer <token>` 旁路；
+ *   栅栏通过时该旁路完全不参与，所以浏览器路径逐字节不变。默认 extToken 为空 = 关闭，
+ *   此时不存在任何新放行。详见 lib/ext-token.js 顶部的四条安全约定。
  */
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
@@ -22,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 import {
   PYTHON_MISSING_HINT,
   S3DM_VERSION,
+  DEFAULT_DEFLECTION_MM,
   cacheDir,
   cacheKeyFor,
   cachePathFor,
@@ -39,6 +46,8 @@ import {
 import {
   completeFilePath,
   isAllowedExtension,
+  normalizeAngularDeflection,
+  normalizeCreaseAngle,
   normalizeDeflection,
   normalizeMaxTriangles,
   precisionTier,
@@ -48,9 +57,25 @@ import {
 import { handoffPathFor, writeHandoffFile } from './lib/handoff.js';
 import { findDesignIdForPath } from './lib/paths.js';
 import { readSketchesForPath } from './lib/sketches.js';
+import {
+  MIN_TOKEN_LENGTH,
+  createExtConfigSchema,
+  readBearerToken,
+  resolveExternalAuth,
+  tokensEqual,
+} from './lib/ext-token.js';
 
 export const name = 'sw-3d-preview';
 export const inject = ['webServer', 'connection'];
+
+/**
+ * 插件配置（可选，全部有默认值，不配就与旧行为一致）。
+ *
+ * cordis 只要求 `Config` 是 standard-schema（`~standard.validate`），不强制 Schemastery；
+ * 用 standard-schema 是为了让本包离线可测 —— `test/ext-token.mjs` 不装任何依赖也能
+ * `import('../index.js')`，而 `@deepseek-ai/schemastery` 只有 DSH 安装内才解析得到。
+ */
+export const Config = createExtConfigSchema();
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
 const THREE_CJS_PATH = path.join(PLUGIN_DIR, 'vendor', 'three.cjs');
@@ -72,23 +97,118 @@ const ROUTES = Object.freeze({
   sketches: '/sw3d/sketches',
 });
 
+/**
+ * 路由 → scope 归类。
+ *
+ * 这张表是**唯一真相**：外部 token 旁路用它决定某个请求需要哪个 scope，
+ * 测试也用它交叉校验 —— 将来新增路由若忘了归类，`FALLBACK_SCOPE` 会把它按最严处理
+ * （宁可拒绝，不要漏放），测试里的覆盖率断言也会提醒补表。
+ *
+ * 两种写法都支持：
+ *   1) 整条路由单一 scope：`'/sw3d/ping': 'read'`
+ *   2) 按 HTTP 方法细分：  `'/sw3d/annotation': { GET: 'read', POST: 'write' }`
+ *
+ * 为什么要按方法细分：同一条路由的读写语义可能不同。
+ * `/sw3d/annotation` 的 GET 只列出标注（纯读），POST 的 op:'upsert' 会追加写
+ * annotations.jsonl（会改状态）。整条标成 write 会让默认配置 `extTokenScopes:['read']`
+ * 的外部客户端**读不到人类批注**，而「Codex 读取人类批注」正是这条旁路的核心场景。
+ *
+ *   read  = 只读、不落盘、不产出用户可见文件
+ *   write = 会改状态（写标注 / 交接单 / 截图）或生成网格缓存
+ *
+ * 方法表里**没列出的方法**按 `FALLBACK_SCOPE` 处理（最严）。
+ */
+export const ROUTE_SCOPES = Object.freeze({
+  [ROUTES.ping]: 'read',
+  [ROUTES.three]: 'read',
+  [ROUTES.sketches]: 'read',
+  [ROUTES.mesh]: 'read',
+  [ROUTES.resolve]: 'read',
+  // GET 列出标注 = 只读；POST 可能是 op:'upsert'，会追加写 annotations.jsonl。
+  // 注意 POST 的 op:'list' 也是读，但它与 upsert 共用一条路由，按最严的 upsert 归类。
+  [ROUTES.annotation]: Object.freeze({ GET: 'read', POST: 'write' }),
+  // 整条 write，**包括 GET**：GET 在交接单文件不存在时会现场生成并写盘
+  // （handleHandoff 里 markdown == null 就调 writeHandoffFile），所以它不是只读路由。
+  // 别因为「GET 通常是读」就把它改成 read —— 那等于给只读 token 开一个写盘入口。
+  [ROUTES.handoff]: 'write',
+  [ROUTES.snapshot]: 'write',
+});
+
+/** 未归类（或方法未列出）时按最严的 scope 处理。 */
+export const FALLBACK_SCOPE = 'write';
+
+/**
+ * 某个路由 + 方法需要的 scope（未归类按最严处理）。导出给测试用，保证归类表不会静默退化。
+ *
+ * @param {string} routePath 路由路径
+ * @param {string} [method] HTTP 方法；路由按方法细分时**必须**给，否则退回最严
+ * @returns {'read'|'write'}
+ */
+export function scopeForRoute(routePath, method) {
+  const rule = ROUTE_SCOPES[routePath];
+  if (rule === undefined) return FALLBACK_SCOPE;
+  if (typeof rule === 'string') return rule;
+  // 按方法细分：方法缺省或未列出 → 最严，不给「忘了传 method 就意外放宽」留口子
+  const normalized = typeof method === 'string' ? method.toUpperCase() : '';
+  const byMethod = normalized ? rule[normalized] : undefined;
+  return typeof byMethod === 'string' ? byMethod : FALLBACK_SCOPE;
+}
+
 const PACKAGE = (() => {
   try {
     const parsed = JSON.parse(readFileSync(path.join(PLUGIN_DIR, 'package.json'), 'utf8'));
     return {
-      name: typeof parsed.name === 'string' ? parsed.name : '@local/dsh-sw-3d-preview',
+      name: typeof parsed.name === 'string' ? parsed.name : 'dsh-sw-3d-preview',
       version: typeof parsed.version === 'string' ? parsed.version : '0.1.0',
     };
   } catch {
-    return { name: '@local/dsh-sw-3d-preview', version: '0.1.0' };
+    return { name: 'dsh-sw-3d-preview', version: '0.1.0' };
   }
 })();
 
-// --------------------------------------------------------------------------- HTTP 小工具
+// --------------------------------------------------------------------------- 日志
+//
+// 统一前缀格式：`[sw-3d-preview] <级别>: <消息>`。
+// 级别只有五种，全部用小写英文单词，方便 grep：
+//   error  —— 异常/堆栈（logError）
+//   warn   —— 配置问题、需要人看一眼的情况（logWarn）
+//   info   —— 一次性状态变更，如「外部访问已启用」（logInfo）
+//   auth   —— 外部 token 旁路的判定结果（logExternal）
+// 历史上这里混过 `sw3d: …` 与裸中文前缀，排障时无法按前缀统一过滤；现已收敛到上面这套。
+
+/** 写一行日志。所有日志都必须经过这里，保证前缀一致。 */
+function logLine(level, message) {
+  process.stderr.write(`[sw-3d-preview] ${level}: ${message}\n`);
+}
 
 function logError(message, error) {
   const detail = error && error.stack ? error.stack : String(error);
-  process.stderr.write(`[sw-3d-preview] ${message}: ${detail}\n`);
+  logLine('error', `${message}: ${detail}`);
+}
+
+/** 配置提醒 / 可恢复的问题。 */
+function logWarn(message) {
+  logLine('warn', message);
+}
+
+/** 一次性状态变更（插件激活时打一次）。 */
+function logInfo(message) {
+  logLine('info', message);
+}
+
+/**
+ * 外部 token 旁路的判定日志。
+ *
+ * 硬约束：**绝不打印 token**（明文的、哈希的、前缀的都不打）。只写方法、路径、
+ * scope 和一句原因 —— 这些足够排查「为什么 curl 还是 401」，又不构成凭据泄漏。
+ *
+ * @param {'authorized'|'denied'|'rejected'} outcome
+ * @param {string} method
+ * @param {string} routePath
+ * @param {string} detail
+ */
+function logExternal(outcome, method, routePath, detail) {
+  logLine('auth', `external client ${outcome} for ${method} ${routePath} ${detail}`);
 }
 
 function errorBody(code, message, hint, detail) {
@@ -276,7 +396,7 @@ async function listAnnotations(filePath) {
 
 // --------------------------------------------------------------------------- 网格构建
 
-function meshFromParsed(parsed, { meshPath, format, bytes, mtimeMs, deflection = 0.2, maxTriangles = 0 }) {
+function meshFromParsed(parsed, { meshPath, format, bytes, mtimeMs, deflection = DEFAULT_DEFLECTION_MM, maxTriangles = 0 }) {
   const positions = parsed.vertices;
   const vertexCount = positions.length / 3;
   const triangleCount = parsed.indices.length / 3;
@@ -315,11 +435,60 @@ function meshFromParsed(parsed, { meshPath, format, bytes, mtimeMs, deflection =
 
 // --------------------------------------------------------------------------- handlers
 
-function createHandlers(ctx) {
+function createHandlers(ctx, externalAuth) {
   const builds = new Map();
   let annotationTail = Promise.resolve();
 
-  function allowTrusted(req, res) {
+  /**
+   * 外部 token 旁路的生效配置（在 apply 里用 resolveExternalAuth 算好传进来，这里只读）。
+   * enabled === false 时 checkExternal 第一行就返回，等于没有这段代码。
+   */
+  const external = externalAuth;
+
+  /** 某个路由 + 方法需要的 scope（未归类按最严处理）。 */
+  function scopeOf(routePath, method) {
+    return scopeForRoute(routePath, method);
+  }
+
+  /**
+   * 外部进程旁路：`Authorization: Bearer <token>` + scope 判定。
+   *
+   * 返回 'allow' | 'deny'（两个结果对调用方是同一件事：都不是信任客户端）。
+   * 之所以还区分，是为了让日志说清是「token 错」还是「scope 不够」——
+   * **响应体一律不体现这个区别**，调用方对外只回原来那个状态码。
+   */
+  function checkExternal(req, routePath, method) {
+    if (!external.enabled) return 'deny';
+    let candidate;
+    try {
+      candidate = readBearerToken(req);
+    } catch (error) {
+      logError('读取 Authorization 头失败', error);
+      return 'deny';
+    }
+    if (candidate === null) return 'deny';
+    // 定长比较：长度不等也走满一次 timingSafeEqual（内部先 sha256 成定长）
+    if (!tokensEqual(candidate, external.token)) {
+      logExternal('rejected', method, routePath, 'token-mismatch');
+      return 'deny';
+    }
+    // method 必须传下去：/sw3d/annotation 的 GET 是 read、POST 是 write
+    const scope = scopeOf(routePath, method);
+    if (!external.scopes.includes(scope)) {
+      logExternal('denied', method, routePath, `scope=${scope} not granted (have: ${external.scopes.join(',') || 'none'})`);
+      return 'deny';
+    }
+    logExternal('authorized', method, routePath, `scope=${scope}`);
+    return 'allow';
+  }
+
+  /**
+   * 信任栅栏（原有逻辑，逐字节保留）：返回 true = 放行。
+   *
+   * 顺序硬要求：先走原有栅栏；通过就立刻返回，外部 token 完全不参与 ——
+   * 浏览器路径的行为因此与加这段代码之前完全一致。
+   */
+  function allowTrusted(req, res, routePath) {
     let rejection;
     try {
       rejection = ctx.connection.requestRejection(req);
@@ -328,6 +497,25 @@ function createHandlers(ctx) {
       rejection = 403;
     }
     if (rejection === undefined) return true;
+
+    // —— 原有栅栏失败，才尝试外部旁路 ——
+    const method = String(req.method || 'GET').toUpperCase();
+    if (routePath && checkExternal(req, routePath, method) === 'allow') {
+      // 这里**不需要**再补 Cache-Control: no-store。
+      //
+      // 曾经这里有一句 res.setHeader('cache-control','no-store')，注释说它防中间层缓存
+      // 「带 token 才拿得到的响应」。实际上那是**死代码**：放行后每个 handler 都会走
+      // sendJson / sendText / fail / 自己的 res.writeHead，四者都已显式写 no-store，
+      // setHeader 必然被随后的 writeHead 覆盖。变异验证（删掉那三行）时 27 项全绿，
+      // 就是这个原因 —— 一条没有测试保护的「防线」不能算防线。
+      //
+      // no-store 的唯一契约落在 sendJson / sendText / fail 与各 handler 的 writeHead 上，
+      // 由 test/ext-token.mjs 的 10b 对「放行 200 / 拒绝 401 / scope 不够 403」三条
+      // 路径逐条断言。新增 handler 时请沿用 sendJson/sendText，别自己裸写 writeHead。
+      return true;
+    }
+
+    // —— 都不通过：保持原来那个状态码与响应体，不泄漏失败原因 ——
     res.writeHead(rejection, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
     res.end();
     return false;
@@ -359,7 +547,7 @@ function createHandlers(ctx) {
   }
 
   async function handlePing(req, res) {
-    if (!allowTrusted(req, res)) return;
+    if (!allowTrusted(req, res, ROUTES.ping)) return;
     if (!allowMethods(req, res, ['GET', 'HEAD'])) return;
     const python = await pythonInfo();
     sendJson(req, res, 200, {
@@ -378,7 +566,7 @@ function createHandlers(ctx) {
   }
 
   async function handleResolve(req, res) {
-    if (!allowTrusted(req, res)) return;
+    if (!allowTrusted(req, res, ROUTES.resolve)) return;
     if (!allowMethods(req, res, ['GET', 'HEAD'])) return;
     const url = requestUrl(req);
     const requested = url.searchParams.get('path') || '';
@@ -394,16 +582,19 @@ function createHandlers(ctx) {
       return;
     }
     const refresh = ['1', 'true', 'yes', 'on'].includes(String(url.searchParams.get('refresh') || '').toLowerCase());
+    const sketchOnly = resolved.meshSource === 'sketch-only';
     const meshPath = resolved.sibling || resolved.path;
     const cacheOptions = {
       path: meshPath,
       mtimeMs: resolved.mtimeMs,
       bytes: resolved.bytes,
       deflection: params.deflection,
+      angularDeflection: params.angularDeflection,
+      creaseAngle: params.creaseAngle,
       maxTriangles: params.maxTriangles,
     };
     const cacheFile = cachePathFor(cacheOptions);
-    const cachedStat = refresh ? null : await statSafe(cacheFile);
+    const cachedStat = refresh || sketchOnly ? null : await statSafe(cacheFile);
     const cached = Boolean(cachedStat && cachedStat.isFile() && cachedStat.size > 0);
     sendJson(req, res, 200, {
       ok: true,
@@ -416,12 +607,18 @@ function createHandlers(ctx) {
       designId: resolved.designId || '',
       completed: !!resolved.completed,
       fallback: resolved.fallback || null,
+      // sketch-only：草图视图（没有实体网格）。多这两块让客户端不用猜。
+      sketch: resolved.sketch || null,
+      deliver: resolved.deliver || null,
       precision: {
         tier: params.tier || '',
         deflectionMm: params.deflection,
+        angularDeflectionRad: params.angularDeflection,
+        creaseAngleDeg: params.creaseAngle,
         maxTriangles: params.maxTriangles,
       },
       cached: {
+        // 草图视图没有 S3DM 缓存可言（0 三角形），恒为命中不到
         hit: cached,
         key: cacheKeyFor(cacheOptions),
         path: cacheFile,
@@ -432,15 +629,23 @@ function createHandlers(ctx) {
     });
   }
 
-  /** 精度参数：precision=high|mid|low 优先，其次 deflection/maxTriangles 显式值。 */
+  /**
+   * 精度参数：precision=high|mid|low 优先，其次显式 deflection/maxTriangles/angularDeflection/creaseAngle。
+   *
+   * 四个参数**一律归一化后返回全量**（缺省即取默认档的值），因为它们全部进缓存键：
+   * 若这里返回 undefined，缓存键就会退化成「未定义字符串」，不同请求之间反而可能撞键。
+   */
   function meshParams(url) {
     const tier = precisionTier(url.searchParams.get('precision'));
     const deflection = tier ? tier.deflection : normalizeDeflection(url.searchParams.get('deflection'));
     const maxTriangles = tier ? tier.maxTriangles : normalizeMaxTriangles(url.searchParams.get('maxTriangles'));
-    return { tier: tier ? tier.name : '', deflection, maxTriangles };
+    // 角向挠度 / 折痕角与分辨率档无关：任何档位下都允许单独覆盖（目前客户端不传，留给手工排障）。
+    const angularDeflection = normalizeAngularDeflection(url.searchParams.get('angularDeflection'));
+    const creaseAngle = normalizeCreaseAngle(url.searchParams.get('creaseAngle'));
+    return { tier: tier ? tier.name : '', deflection, angularDeflection, creaseAngle, maxTriangles };
   }
 
-  async function buildS3dm({ cacheFile, resolved, deflection, maxTriangles, meshPath }) {
+  async function buildS3dm({ cacheFile, resolved, deflection, angularDeflection, creaseAngle, maxTriangles, meshPath }) {
     const temporary = `${cacheFile}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
     try {
       ensureDir(path.dirname(cacheFile));
@@ -459,6 +664,8 @@ function createHandlers(ctx) {
           input: meshPath,
           output: temporary,
           deflection,
+          angularDeflection,
+          creaseAngle,
           maxTriangles,
           timeoutMs: STEP_TIMEOUT_MS,
         });
@@ -514,10 +721,10 @@ function createHandlers(ctx) {
     }
   }
 
-  function buildTask({ key, cacheFile, resolved, deflection, maxTriangles, meshPath }) {
+  function buildTask({ key, cacheFile, resolved, deflection, angularDeflection, creaseAngle, maxTriangles, meshPath }) {
     const inflight = builds.get(key);
     if (inflight) return inflight;
-    const task = buildS3dm({ cacheFile, resolved, deflection, maxTriangles, meshPath }).finally(() => {
+    const task = buildS3dm({ cacheFile, resolved, deflection, angularDeflection, creaseAngle, maxTriangles, meshPath }).finally(() => {
       builds.delete(key);
     });
     builds.set(key, task);
@@ -531,7 +738,7 @@ function createHandlers(ctx) {
   }
 
   async function handleMesh(req, res) {
-    if (!allowTrusted(req, res)) return;
+    if (!allowTrusted(req, res, ROUTES.mesh)) return;
     if (!allowMethods(req, res, ['GET', 'HEAD'])) return;
     const url = requestUrl(req);
     const requested = url.searchParams.get('path') || '';
@@ -547,12 +754,44 @@ function createHandlers(ctx) {
       sendJson(req, res, 422, resolved);
       return;
     }
+
+    // ---- 降级：原生件没有 STEP，但有草图 → 不 500/422，回一个明确可区分的 JSON。
+    //
+    // 为什么选「200 + JSON」而不是「0 三角形的合法 S3DM」：
+    //  1) 0 三角形 S3DM 对客户端是**合法空模型**，走完 parseS3DM 会得到一个 bbox 退化、
+    //     没有任何面/边/点的 viewer —— 那正是「红字失败卡」换了个马甲：用户看到一片空白，
+    //     而且客户端无法区分「模型确实是空的」与「这个文件压根没有网格源」。
+    //  2) JSON 响应能被客户端按 content-type 一眼分流（不必先试解析二进制），
+    //     `mode:'sketch-only'` 是显式枚举，未来加别的降级模式也不会和网格混淆。
+    //  3) S3DM 里没有地方塞「下一步该干什么」（sketchUrl / deliver），JSON 里能。
+    // 既有行为不受影响：STEP/STL/OBJ 与「有同名 STEP 的 SLDPRT」都走下面的原路径，逐字节不变。
+    if (resolved.meshSource === 'sketch-only') {
+      const sketchUrl = (resolved.sketch && resolved.sketch.url) ||
+        `/sw3d/sketches?path=${encodeURIComponent(resolved.path)}`;
+      sendJson(req, res, 200, {
+        ok: true,
+        mode: 'sketch-only',
+        meshSource: 'sketch-only',
+        path: resolved.path,
+        format: resolved.format,
+        designId: resolved.designId || '',
+        sketchUrl,
+        deliver: resolved.deliver || null,
+        sketch: resolved.sketch || null,
+        hint: '这个文件没有可用的 STEP 网格：当前只显示草图轮廓，没有实体。面/边/点拾取、剖切、封盖、取样都不可用。',
+        hints: resolved.hints || [],
+      });
+      return;
+    }
+
     const meshPath = resolved.sibling || resolved.path;
     const cacheOptions = {
       path: meshPath,
       mtimeMs: resolved.mtimeMs,
       bytes: resolved.bytes,
       deflection: params.deflection,
+      angularDeflection: params.angularDeflection,
+      creaseAngle: params.creaseAngle,
       maxTriangles: params.maxTriangles,
     };
     const key = cacheKeyFor(cacheOptions);
@@ -581,6 +820,8 @@ function createHandlers(ctx) {
         cacheFile,
         resolved,
         deflection: params.deflection,
+        angularDeflection: params.angularDeflection,
+        creaseAngle: params.creaseAngle,
         maxTriangles: params.maxTriangles,
         meshPath,
       });
@@ -605,7 +846,11 @@ function createHandlers(ctx) {
       'x-sw3d-source': resolved.meshSource,
       'x-sw3d-cache': hit ? 'hit' : 'miss',
       'x-sw3d-version': String(loaded.header.version || 1),
+      // 老字段保持 `<deflection>/<maxTriangles>` 的形状不变（客户端/脚本可能按它解析）。
       'x-sw3d-precision': `${params.deflection}/${params.maxTriangles}`,
+      // 新字段把三角化三参数一次说清：`<deflection>mm/<angular>rad/<crease>deg`，
+      // 用于排障与回归测试 —— 只看旧字段无法判断角向挠度/折痕角是否真的透传到了 python。
+      'x-sw3d-tessellation': `${params.deflection}mm/${params.angularDeflection}rad/${params.creaseAngle}deg`,
       'x-sw3d-bbox': formatBbox(loaded.header.bbox),
     });
     if (String(req.method || '').toUpperCase() === 'HEAD') res.end();
@@ -613,7 +858,7 @@ function createHandlers(ctx) {
   }
 
   async function handleThree(req, res) {
-    if (!allowTrusted(req, res)) return;
+    if (!allowTrusted(req, res, ROUTES.three)) return;
     if (!allowMethods(req, res, ['GET', 'HEAD'])) return;
     if (!existsSync(THREE_CJS_PATH)) {
       sendText(req, res, 404, 'vendor/three.cjs 不存在');
@@ -681,7 +926,7 @@ function createHandlers(ctx) {
   }
 
   async function handleAnnotation(req, res) {
-    if (!allowTrusted(req, res)) return;
+    if (!allowTrusted(req, res, ROUTES.annotation)) return;
     if (!allowMethods(req, res, ['GET', 'POST'])) return;
     const file = annotationFile();
 
@@ -765,7 +1010,7 @@ function createHandlers(ctx) {
    *   GET  ?path=  → 返回 Markdown 文本（text/markdown；没有就先生成）
    */
   async function handleHandoff(req, res) {
-    if (!allowTrusted(req, res)) return;
+    if (!allowTrusted(req, res, ROUTES.handoff)) return;
     if (!allowMethods(req, res, ['GET', 'POST'])) return;
     const method = String(req.method || 'GET').toUpperCase();
     let requested = '';
@@ -850,7 +1095,7 @@ function createHandlers(ctx) {
    *   （通道 B：草稿附件通道不可用时的兜底，模型可以直接 read_image 这个路径）
    */
   async function handleSnapshot(req, res) {
-    if (!allowTrusted(req, res)) return;
+    if (!allowTrusted(req, res, ROUTES.snapshot)) return;
     if (!allowMethods(req, res, ['POST'])) return;
     const contentType = String(req.headers['content-type'] || '').toLowerCase();
     if (!contentType.includes('application/json')) {
@@ -930,7 +1175,7 @@ function createHandlers(ctx) {
    *   不修改任何 project json，不碰 SOLIDWORKS。
    */
   async function handleSketches(req, res) {
-    if (!allowTrusted(req, res)) return;
+    if (!allowTrusted(req, res, ROUTES.sketches)) return;
     if (!allowMethods(req, res, ['GET', 'HEAD'])) return;
     const url = requestUrl(req);
     const requested = url.searchParams.get('path') || '';
@@ -962,8 +1207,20 @@ function createHandlers(ctx) {
 
 // --------------------------------------------------------------------------- 插件入口
 
-export function apply(ctx) {
-  const handlers = createHandlers(ctx);
+export function apply(ctx, config) {
+  // 外部 token 旁路：默认关闭。配置有问题一律 fail-closed（当作没配），
+  // 原因写进日志 —— 绝不因为一个笔误把入口打开，也绝不把 token 写进日志。
+  const externalAuth = resolveExternalAuth(config);
+  for (const problem of externalAuth.problems) {
+    logWarn(problem);
+  }
+  if (externalAuth.enabled) {
+    logInfo(
+      `外部 Bearer token 旁路已启用（scopes=${externalAuth.scopes.join(',') || 'none'}；token 不低于 ${MIN_TOKEN_LENGTH} 字符）`,
+    );
+  }
+
+  const handlers = createHandlers(ctx, externalAuth);
   const register = (routePath, handler, label) => {
     ctx.effect(
       () =>

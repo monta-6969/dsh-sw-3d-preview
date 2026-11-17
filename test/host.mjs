@@ -21,9 +21,17 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_DIR = path.dirname(HERE);
+// 版本号一律从 package.json 读（index.js 也是这么读的），避免升版本后测试写死失效。
+const PKG = JSON.parse(fs.readFileSync(path.join(PLUGIN_DIR, 'package.json'), 'utf8'));
 const SAMPLE_DIR = 'C:\\Users\\mota\\Desktop\\工程自动化';
 const SAMPLE_STEP = path.join(SAMPLE_DIR, '锁盖.STEP');
 const SAMPLE_SLDPRT = path.join(SAMPLE_DIR, '锁盖.SLDPRT');
+
+// 测「显式参数真的透传了」时用的挠度：刻意取一个**不等于任何默认档**的值
+// （默认 0.08 / high 0.04 / low 0.2），这样 header 里读回它才说明 --deflection 生效，
+// 而不是碰巧等于默认值。同时比默认值粗，不会触发 step_mesh.py 的「超上限就加粗重试」分支，
+// 保证 header.deflectionMm 就是传进去的那个数。
+const EXPLICIT_DEFLECTION = 0.13;
 
 // 把 LOCALAPPDATA 指到临时沙箱：缓存与标注写到那里，测试结束后整目录删掉。
 // 真实值单独留一份：草图路由那组测试要**只读**真实的 %LOCALAPPDATA%\sw-mcp\projects。
@@ -33,6 +41,9 @@ process.env.LOCALAPPDATA = sandbox;
 
 const {
   S3DM_VERSION,
+  DEFAULT_ANGULAR_DEFLECTION_RAD,
+  DEFAULT_CREASE_ANGLE_DEG,
+  DEFAULT_DEFLECTION_MM,
   cacheKeyFor,
   cachePathFor,
   handoffDir,
@@ -43,13 +54,18 @@ const {
   readS3dmHeader,
   runStepMesh,
   sha1,
+  stepMeshArgs,
   writeS3dm,
 } = await import('../lib/mesh.js');
 const {
   DEFAULT_MAX_TRIANGLES,
+  MIN_MAX_TRIANGLES,
+  PRECISION_TIERS,
   completeFilePath,
   findFallbackStep,
   nameSimilarity,
+  normalizeAngularDeflection,
+  normalizeCreaseAngle,
   normalizeMaxTriangles,
   resolveSource,
 } = await import('../lib/resolve.js');
@@ -147,10 +163,19 @@ async function testRoundtrip() {
 
   pass('1. S3DM 写→读往返（header 字段 + 8 个 buffer 字节一致 + 非 4 对齐补零）');
   // 缓存键必须区分精度档（deflection / maxTriangles）
-  const baseOptions = { path: SAMPLE_STEP, mtimeMs: 1000, bytes: 100, deflection: 0.2, maxTriangles: 300000 };
+  // 数值一律由 lib/mesh.js、lib/resolve.js 的导出量算出，不写死具体数字：
+  // 精度档已经被有意调过一次（0.2→0.08），写死数字的断言每次都跟着烂一次。
+  const baseOptions = {
+    path: SAMPLE_STEP,
+    mtimeMs: 1000,
+    bytes: 100,
+    deflection: DEFAULT_DEFLECTION_MM,
+    maxTriangles: DEFAULT_MAX_TRIANGLES,
+  };
   const keyA = cacheKeyFor(baseOptions);
-  const keyB = cacheKeyFor({ ...baseOptions, maxTriangles: 120000 });
-  const keyC = cacheKeyFor({ ...baseOptions, deflection: 0.5 });
+  // 这两个只要求「与 base 不同」，所以用默认值的 +1 和半档，天然跟随默认值，永不过期。
+  const keyB = cacheKeyFor({ ...baseOptions, maxTriangles: DEFAULT_MAX_TRIANGLES + 1 });
+  const keyC = cacheKeyFor({ ...baseOptions, deflection: DEFAULT_DEFLECTION_MM / 2 });
   assert.notEqual(keyA, keyB, 'maxTriangles 必须进缓存键');
   assert.notEqual(keyA, keyC, 'deflection 必须进缓存键');
   assert.equal(keyA, cacheKeyFor({ ...baseOptions }), '同样参数必须得到同样的键');
@@ -158,8 +183,74 @@ async function testRoundtrip() {
   assert.equal(normalizeMaxTriangles('900000'), 900000);
   assert.equal(normalizeMaxTriangles('abc'), DEFAULT_MAX_TRIANGLES);
   assert.equal(normalizeMaxTriangles('0'), DEFAULT_MAX_TRIANGLES);
-  assert.equal(normalizeMaxTriangles('10'), 2000, '低于下限夹到 2000');
+  assert.equal(normalizeMaxTriangles('10'), MIN_MAX_TRIANGLES, `低于下限夹到 ${MIN_MAX_TRIANGLES}`);
+  // lib/resolve.js 的注释写明「mid = 默认档，deflection 必须等于 step_mesh.py 的 DEFAULT_DEFLECTION，
+  // maxTriangles 必须等于其 MAX_TRIANGLES」，否则「不传参/传 mid/python 默认」三条路径会分叉成两份缓存。
+  // 这里把这条跨文件不变量钉成断言：以后谁改一边不改另一边，先红在这里。
+  assert.equal(PRECISION_TIERS.mid.deflection, DEFAULT_DEFLECTION_MM, 'mid 档 deflection 必须等于 mesh.js 默认值');
+  assert.equal(PRECISION_TIERS.mid.maxTriangles, DEFAULT_MAX_TRIANGLES, 'mid 档 maxTriangles 必须等于 DEFAULT_MAX_TRIANGLES');
   pass('1b. 缓存键含 deflection + maxTriangles，且键盘归一化正确', `key=${keyA.slice(0, 12)}… 默认上限=${DEFAULT_MAX_TRIANGLES}`);
+}
+
+// --------------------------------------------------------------------------- 测试 1c：JS 常量 ↔ python 源码常量
+//
+// lib/mesh.js:53-58 的注释写明「这三个值必须与 step_mesh.py 顶部常量逐位一致，
+// test/host.mjs 会直接读源码做断言」。**那条注释曾经是假的**：host.mjs 从来没有读过
+// step_mesh.py，所有等式断言都在 JS 常量之间自证（PRECISION_TIERS.mid.deflection ===
+// DEFAULT_DEFLECTION_MM 两边都是 JS），python 侧完全不在断言范围内。
+//
+// 后果很具体：stepMeshArgs 总是显式传三个参数（见 lib/mesh.js:986 的注释），
+// 所以「改 python 常量不改 JS」= 测试全绿，但宿主传的值把 python 调优悄悄覆盖掉。
+//
+// 这里补上真正的那条：**纯文本解析 step_mesh.py 源码常量，不跑 python、不依赖 OCP、不碰 SOLIDWORKS**。
+function testPythonConstants() {
+  const scriptPath = path.join(PLUGIN_DIR, 'lib', 'step_mesh.py');
+  assert.ok(fs.existsSync(scriptPath), `step_mesh.py 不存在：${scriptPath}`);
+  const py = fs.readFileSync(scriptPath, 'utf8');
+
+  /** 取 python 里 `NAME = 123` 形式的数值常量；取不到就直接抛（不让断言静默跳过）。 */
+  const num = (name) => {
+    const match = new RegExp(`^${name}\\s*=\\s*(-?[\\d.]+)`, 'm').exec(py);
+    assert.ok(match, `step_mesh.py 里找不到常量 ${name}（正则 ^${name}\\s*=\\s*数字）`);
+    const value = Number(match[1]);
+    assert.ok(Number.isFinite(value), `step_mesh.py 的 ${name} 不是有限数字：${match[1]}`);
+    return value;
+  };
+
+  // 三个三角化参数：JS 默认值必须与 python 常量逐位一致
+  assert.equal(num('DEFAULT_DEFLECTION'), DEFAULT_DEFLECTION_MM,
+    'step_mesh.py 的 DEFAULT_DEFLECTION 必须等于 mesh.js 的 DEFAULT_DEFLECTION_MM');
+  assert.equal(num('ANGULAR_DEFLECTION'), DEFAULT_ANGULAR_DEFLECTION_RAD,
+    'step_mesh.py 的 ANGULAR_DEFLECTION 必须等于 mesh.js 的 DEFAULT_ANGULAR_DEFLECTION_RAD');
+  assert.equal(num('CREASE_ANGLE_DEG'), DEFAULT_CREASE_ANGLE_DEG,
+    'step_mesh.py 的 CREASE_ANGLE_DEG 必须等于 mesh.js 的 DEFAULT_CREASE_ANGLE_DEG');
+  assert.equal(num('MAX_TRIANGLES'), DEFAULT_MAX_TRIANGLES,
+    'step_mesh.py 的 MAX_TRIANGLES 必须等于 resolve.js 的 DEFAULT_MAX_TRIANGLES');
+
+  // 每档 precision 都必须与 python 侧语义自洽：mid 就是 python 默认档（已由上面的
+  // DEFAULT_* 断言覆盖），low/high 是相对它的粗细档 —— high 更细（值更小）、low 更粗（值更大）。
+  // 这里只断言**相对关系**，不写死数值（精度档曾被有意调整过一次，写死每次都要跟着烂）。
+  const pyDefault = num('DEFAULT_DEFLECTION');
+  assert.ok(PRECISION_TIERS.high.deflection < pyDefault,
+    `high 档应比默认档更细（值更小），实际 ${PRECISION_TIERS.high.deflection} vs python ${pyDefault}`);
+  assert.ok(PRECISION_TIERS.low.deflection > pyDefault,
+    `low 档应比默认档更粗（值更大），实际 ${PRECISION_TIERS.low.deflection} vs python ${pyDefault}`);
+
+  // stepMeshArgs 必须**总是**显式传三个参数：这条断言把 mesh.js 顶部注释从「说法」变成「事实」
+  const argv = stepMeshArgs({ input: 'in.step', output: 'out.s3dm' });
+  const flagValue = (flag) => {
+    const index = argv.indexOf(flag);
+    if (index < 0) return null;
+    return argv[index + 1];
+  };
+  assert.equal(Number(flagValue('--deflection')), DEFAULT_DEFLECTION_MM, 'stepMeshArgs 必须总是显式传 --deflection');
+  assert.equal(Number(flagValue('--angular-deflection')), DEFAULT_ANGULAR_DEFLECTION_RAD, 'stepMeshArgs 必须总是显式传 --angular-deflection');
+  assert.equal(Number(flagValue('--crease-angle')), DEFAULT_CREASE_ANGLE_DEG, 'stepMeshArgs 必须总是显式传 --crease-angle');
+
+  pass(
+    '1c. JS 精度常量与 step_mesh.py 源码常量逐位一致（纯文本解析，不跑 python）',
+    `deflection=${DEFAULT_DEFLECTION_MM} · angular=${DEFAULT_ANGULAR_DEFLECTION_RAD} · crease=${DEFAULT_CREASE_ANGLE_DEG} · maxTriangles=${DEFAULT_MAX_TRIANGLES}`,
+  );
 }
 
 // --------------------------------------------------------------------------- 测试 2：STEP 三角化
@@ -180,7 +271,7 @@ async function testStepMesh() {
   const out = path.join(os.tmpdir(), `sw3d-step-${Date.now()}.s3dm`);
   try {
     const started = Date.now();
-    const result = await runStepMesh({ python, input: SAMPLE_STEP, output: out, deflection: 0.2 });
+    const result = await runStepMesh({ python, input: SAMPLE_STEP, output: out, deflection: EXPLICIT_DEFLECTION });
     const elapsed = Date.now() - started;
     assert.equal(result.ok, true, `step_mesh.py 失败（${result.code}）：${result.stderrTail}`);
     const fileBytes = fs.readFileSync(out);
@@ -231,8 +322,11 @@ async function testStepMesh() {
       assert.ok(faceEdge[i] < header.faceCount, `faceEdge.face=${faceEdge[i]} 应 < ${header.faceCount}`);
       assert.ok(faceEdge[i + 1] < header.edgeCount, `faceEdge.edge=${faceEdge[i + 1]} 应 < ${header.edgeCount}`);
     }
-    assert.equal(header.maxTriangles, 300000);
-    assert.deepEqual(header.precision, { deflectionMm: 0.2, maxTriangles: 300000 });
+    // 没传 maxTriangles → python 用自己文件里的 MAX_TRIANGLES；step_mesh.py 注释写明它应与
+    // lib/resolve.js 的 DEFAULT_MAX_TRIANGLES 一致，所以这里拿导出的常量比，而不是写死 300000。
+    assert.equal(header.maxTriangles, DEFAULT_MAX_TRIANGLES);
+    assert.equal(header.deflectionMm, EXPLICIT_DEFLECTION, '显式 deflection 必须原样写进 header');
+    assert.deepEqual(header.precision, { deflectionMm: EXPLICIT_DEFLECTION, maxTriangles: DEFAULT_MAX_TRIANGLES });
     assert.match(header.generatedAt, /^\d{4}-\d{2}-\d{2}T/);
     // 每个面至少能通过 faceEdge 找到一条边（锁盖是实体，没有孤立面）
     const facesWithEdges = new Set();
@@ -246,7 +340,7 @@ async function testStepMesh() {
         python,
         input: SAMPLE_STEP,
         output: cappedOut,
-        deflection: 0.2,
+        deflection: EXPLICIT_DEFLECTION,
         maxTriangles: 2000,
       });
       assert.equal(capped.ok, true, `--max-triangles 2000 失败：${capped.stderrTail}`);
@@ -256,7 +350,7 @@ async function testStepMesh() {
       assert.ok(cappedHeader.triangleCount <= 2000, `triangleCount=${cappedHeader.triangleCount} 应 <= 2000`);
       pass(
         '2b. --max-triangles 生效',
-        `deflection=0.2 maxTriangles=2000 → triangles=${cappedHeader.triangleCount} header.maxTriangles=${cappedHeader.maxTriangles}`,
+        `deflection=${EXPLICIT_DEFLECTION} maxTriangles=2000 → triangles=${cappedHeader.triangleCount} header.maxTriangles=${cappedHeader.maxTriangles}`,
       );
     } finally {
       fs.rmSync(cappedOut, { force: true });
@@ -728,8 +822,8 @@ async function testRoutes() {
   assert.match(String(response.headers['content-type']), /application\/json/);
   const ping = JSON.parse(response.body.toString('utf8'));
   assert.equal(ping.ok, true);
-  assert.equal(ping.name, '@local/dsh-sw-3d-preview');
-  assert.equal(ping.version, '0.2.0');
+  assert.equal(ping.name, 'dsh-sw-3d-preview');
+  assert.equal(ping.version, PKG.version, `ping.version 应等于 package.json 的版本 ${PKG.version}`);
   assert.ok(ping.cacheDir.startsWith(sandbox), `cacheDir 应在测试沙箱里：${ping.cacheDir}`);
   assert.equal(typeof ping.three, 'boolean');
   assert.equal(typeof ping.python.ok, 'boolean');
@@ -826,7 +920,10 @@ async function testRoutes() {
       resolveDetail = `format=${resolved.format} cached.hit=${resolved.cached.hit}`;
 
       // mesh：第一次 miss，第二次 hit
-      const meshUrl = `/sw3d/mesh?path=${encodeURIComponent(SAMPLE_STEP)}&deflection=0.2`;
+      // 建缓存与后面查缓存必须用**同一口径**：都不传参数（走宿主默认档），
+      // 这样 :870 的「默认请求应命中缓存」才成立。原先这里写死 &deflection=0.2，
+      // 默认值改成 0.08 之后建键/查键分叉，测的就不再是「第二次命中」而是「不同精度不命中」。
+      const meshUrl = `/sw3d/mesh?path=${encodeURIComponent(SAMPLE_STEP)}`;
       response = await call(routes.get('/sw3d/mesh'), 'GET', meshUrl);
       assert.equal(response.status, 200, response.body.toString('utf8').slice(0, 400));
       assert.equal(response.headers['content-type'], 'application/octet-stream');
@@ -838,17 +935,26 @@ async function testRoutes() {
       assert.equal(response.headers['x-sw3d-bbox'], header.bbox.map((v) => String(Math.round(v * 1000) / 1000)).join(','));
       const firstCache = response.headers['x-sw3d-cache'];
       assert.ok(firstCache === 'hit' || firstCache === 'miss');
+      // 三角化三参数：不传参时就该是 mesh.js 里那三个默认值。
+      // 这三条原先没有断言，所以 ANGULAR_DEFLECTION 0.5→0.12、新增 CREASE 35.0 时测试毫无反应。
+      assert.equal(
+        response.headers['x-sw3d-tessellation'],
+        `${DEFAULT_DEFLECTION_MM}mm/${DEFAULT_ANGULAR_DEFLECTION_RAD}rad/${DEFAULT_CREASE_ANGLE_DEG}deg`,
+        'x-sw3d-tessellation 必须反映三个默认三角化参数',
+      );
 
       response = await call(routes.get('/sw3d/mesh'), 'GET', meshUrl);
       assert.equal(response.headers['x-sw3d-cache'], 'hit');
       meshDetail = `source=${response.headers['x-sw3d-source']} bbox=${response.headers['x-sw3d-bbox']} 首次=${firstCache} 二次=hit${meshDetail ? ' · ' + meshDetail : ''}`;
 
       // .sldprt 走同名 STEP：x-sw3d-source 必须是 sibling-step，且命中同一份缓存
+      // 注意这里**不能**再写 &deflection=0.2：上面建缓存用的是默认档，
+      // 传了显式 deflection 就会算出另一个缓存键，变成必然 miss。
       if (fs.existsSync(SAMPLE_SLDPRT)) {
         response = await call(
           routes.get('/sw3d/mesh'),
           'GET',
-          `/sw3d/mesh?path=${encodeURIComponent(SAMPLE_SLDPRT)}&deflection=0.2`,
+          `/sw3d/mesh?path=${encodeURIComponent(SAMPLE_SLDPRT)}`,
         );
         assert.equal(response.status, 200, response.body.toString('utf8').slice(0, 300));
         assert.equal(response.headers['x-sw3d-source'], 'sibling-step');
@@ -862,34 +968,48 @@ async function testRoutes() {
       assert.equal(JSON.parse(response.body.toString('utf8')).cached.hit, true);
 
       // ---- 精度档进缓存键：不同 maxTriangles 生成不同缓存文件、不同响应头
+      // 期望值全部取自 lib/resolve.js 的 PRECISION_TIERS（代码里的真实来源），
+      // 档位数值再调整时这里自动跟随，不会像写死 0.5/0.2 那样再过期一次。
+      const LOW = PRECISION_TIERS.low;
+      const MID = PRECISION_TIERS.mid;
       const resolveLowUrl = `/sw3d/resolve?path=${encodeURIComponent(SAMPLE_STEP)}&precision=low`;
       response = await call(routes.get('/sw3d/resolve'), 'GET', resolveLowUrl);
       const lowResolve = JSON.parse(response.body.toString('utf8'));
       assert.equal(lowResolve.ok, true);
-      assert.deepEqual(lowResolve.precision, { tier: 'low', deflectionMm: 0.5, maxTriangles: 120000 });
+      // resolve 的 precision 是「全量归一化后的四个参数 + tier」，三档都不改角向/折痕角，
+      // 所以 angularDeflectionRad / creaseAngleDeg 取 mesh.js 的默认值。
+      assert.deepEqual(lowResolve.precision, {
+        tier: 'low',
+        deflectionMm: LOW.deflection,
+        angularDeflectionRad: DEFAULT_ANGULAR_DEFLECTION_RAD,
+        creaseAngleDeg: DEFAULT_CREASE_ANGLE_DEG,
+        maxTriangles: LOW.maxTriangles,
+      });
       const resolveMidUrl = `/sw3d/resolve?path=${encodeURIComponent(SAMPLE_STEP)}&precision=mid`;
       response = await call(routes.get('/sw3d/resolve'), 'GET', resolveMidUrl);
       const midResolve = JSON.parse(response.body.toString('utf8'));
-      assert.equal(midResolve.precision.maxTriangles, 300000);
+      assert.equal(midResolve.precision.maxTriangles, MID.maxTriangles);
+      assert.equal(midResolve.precision.deflectionMm, MID.deflection);
       assert.notEqual(lowResolve.cached.path, midResolve.cached.path, '精度档必须是缓存键的一部分');
       assert.notEqual(lowResolve.cached.key, midResolve.cached.key, 'cached.key 也应随精度变化');
 
       response = await call(routes.get('/sw3d/mesh'), 'GET', resolveLowUrl.replace('/resolve', '/mesh'));
       assert.equal(response.status, 200, response.body.toString('utf8').slice(0, 300));
-      assert.equal(response.headers['x-sw3d-precision'], '0.5/120000');
+      assert.equal(response.headers['x-sw3d-precision'], `${LOW.deflection}/${LOW.maxTriangles}`);
       assert.equal(response.headers['x-sw3d-version'], '2');
       const lowHeader = readS3dmHeader(response.body).header;
-      assert.equal(lowHeader.precision.maxTriangles, 120000);
+      assert.equal(lowHeader.precision.maxTriangles, LOW.maxTriangles);
+      assert.equal(lowHeader.precision.deflectionMm, LOW.deflection);
       assert.ok(lowHeader.triangleCount > 0);
 
-      // 显式 maxTriangles 也要透传
+      // 显式 maxTriangles 也要透传（deflection 同理，用同一个「非默认档」的字面量）
       response = await call(
         routes.get('/sw3d/mesh'),
         'GET',
-        `/sw3d/mesh?path=${encodeURIComponent(SAMPLE_STEP)}&deflection=0.2&maxTriangles=5000`,
+        `/sw3d/mesh?path=${encodeURIComponent(SAMPLE_STEP)}&deflection=${EXPLICIT_DEFLECTION}&maxTriangles=5000`,
       );
       assert.equal(response.status, 200);
-      assert.equal(response.headers['x-sw3d-precision'], '0.2/5000');
+      assert.equal(response.headers['x-sw3d-precision'], `${EXPLICIT_DEFLECTION}/5000`);
       assert.equal(readS3dmHeader(response.body).header.maxTriangles, 5000);
       meshDetail += ' · precision=low/mid 缓存分离';
 
@@ -1154,12 +1274,18 @@ async function testLiveServer() {
     const resolveStep = await (await fetch(`${origin}/sw3d/resolve?path=${encodeURIComponent(SAMPLE_STEP)}&precision=mid`)).json();
     assert.equal(resolveStep.ok, true, JSON.stringify(resolveStep));
     assert.equal(resolveStep.format, 'step');
-    assert.equal(resolveStep.precision.maxTriangles, 300000);
+    assert.equal(resolveStep.precision.maxTriangles, PRECISION_TIERS.mid.maxTriangles);
+    assert.equal(resolveStep.precision.deflectionMm, PRECISION_TIERS.mid.deflection);
 
+    // mid 档 = 客户端默认档：x-sw3d-precision 的形状是 `<deflection>/<maxTriangles>`，
+    // 数值取自 lib/resolve.js 的 PRECISION_TIERS.mid（原来是写死 '0.2/300000'，档位调整后过期）。
     const meshStep = await fetch(`${origin}/sw3d/mesh?path=${encodeURIComponent(SAMPLE_STEP)}&precision=mid`);
     assert.equal(meshStep.status, 200);
     assert.equal(meshStep.headers.get('x-sw3d-version'), '2');
-    assert.equal(meshStep.headers.get('x-sw3d-precision'), '0.2/300000');
+    assert.equal(
+      meshStep.headers.get('x-sw3d-precision'),
+      `${PRECISION_TIERS.mid.deflection}/${PRECISION_TIERS.mid.maxTriangles}`,
+    );
     const stepBuffer = Buffer.from(await meshStep.arrayBuffer());
     const stepS3dm = readS3dm(stepBuffer);
     assert.equal(stepS3dm.header.version, 2);
@@ -1218,7 +1344,7 @@ async function testLiveServer() {
 async function main() {
   console.log(`插件目录：${PLUGIN_DIR}`);
   console.log(`LOCALAPPDATA 沙箱：${sandbox}`);
-  const tests = [testRoundtrip, testStepMesh, testSldprtResolve, testStl, testSyntax, testSketchRoute, testRoutes, testLiveServer];
+  const tests = [testRoundtrip, testPythonConstants, testStepMesh, testSldprtResolve, testStl, testSyntax, testSketchRoute, testRoutes, testLiveServer];
   for (const test of tests) {
     try {
       await test();

@@ -1,5 +1,10 @@
-# 第三方副本（2.1 MB，可由 scripts 重新生成；不是本插件的源码）
-vendor/three.cjs
+# 第三方副本（2.1 MB，three.js r187，MIT）：不是本插件的源码，但**必须提交进 git**。
+# 从 GitHub 源码安装（npm install github:…）时 git 里有什么就装什么，npm 的 files 字段
+# 在这种安装方式下不生效；一旦把它排除在版本之外，/sw3d/three.js 会 404、/sw3d/ping
+# 的 three 字段变成 false。因此它和 client.js 一起纳入版本控制。
+# 注意：client.js 里已内联同一份 three.js，供预览面板本身使用（见 README 已知限制 4）；
+# 这里的 vendor 那份专供 /sw3d/three.js 路由，两者用途不同，不能互相替代。
+# 本行以下不再排除 vendor/three.cjs。
 
 # 依赖与日志
 node_modules/
@@ -7,3 +12,10 @@ node_modules/
 
 # 快照记录（每次跑 tools/snapshot.mjs 追加，本地产物，不入版本）
 snapshots.jsonl
+
+# 打包产物（node scripts/package.mjs 生成，含时间戳与内容哈希，不入版本）
+dist/
+
+# Python 编译缓存（lib/step_mesh.py 每次被调用都会生成 lib/__pycache__/，不入版本）
+__pycache__/
+*.pyc

@@ -1,5 +1,19 @@
 # 只插一行 Host 插件；客户端渲染由 package.json 的 dsh.client 指向 ./client.js（同包根目录）。
 # 拆成两行会让「插件页里关掉那一行」时界面还在、接口却 404，所以不要再单独插 Host 行。
+#
+# config 是**可选**的：整段删掉 = 全部取默认值 = 外部访问关闭，行为与本插件加入
+# Bearer 旁路之前完全一致。需要让外部进程（Codex CLI / curl / 脚本）访问 /sw3d/* 时才填。
 - insert:
     - id: sw-3d-preview
-      name: '@local/dsh-sw-3d-preview'
+      name: 'dsh-sw-3d-preview'
+      config:
+        # 空 = 关闭外部访问（默认）。非空即启用 `Authorization: Bearer <token>` 旁路。
+        # 要求：≥16 字符；短于 16 会按配置错误处理（当作空、即关闭），并在 DSH 日志里提醒。
+        # 生成：node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+        # 只填在**本机 profile 的 patch 层**，不要提交到仓库：它是长期有效的凭据。
+        extToken: ''
+        # 允许外部 token 执行的操作类别，默认只给只读。
+        #   read  → GET /sw3d/ping · /sw3d/resolve · /sw3d/mesh · /sw3d/three.js · /sw3d/sketches
+        #   write → /sw3d/annotation · /sw3d/handoff · /sw3d/snapshot（会写标注/交接单/截图）
+        # 只影响外部 token 这条旁路；浏览器 cookie 路径的权限不受这里任何影响。
+        extTokenScopes: ['read']
