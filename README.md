@@ -1,10 +1,20 @@
 # dsh-sw-3d-preview
 
-**在 DSH 的文件预览面板里直接看 3D 模型，并把「这里」变成一个 agent 能用的坐标。**
+**SOLIDWORKS 建模自动化链路的「眼睛」：把 agent 刚建出来的零件画出来，好让你确认它到底建对不对。**
 
-DSH 原本打不开 `.step` / `.sldprt`。这个插件把 STEP / STL / OBJ 解析成网格画进预览面板，
-配上剖切封盖、面/边/点拾取、三点取样、标注落盘与一份 Markdown 交接单——
-让「那个凸台旁边的圆角」变成一组可以直接交给 agent 的坐标。
+DSH 里 agent 通过 sw-mcp 驱动 SOLIDWORKS 建模，但建完只有一句文字结果——对不对、是不是那个形状，
+人看不见，模型自己也看不见。这个插件补上这一环：把 `deliver` 出来的 STEP/STL/OBJ 解析成网格画进文件预览面板，
+你看着它确认，再把「这个面不对」变成一组**面号+坐标**的标注交回给 agent 去改。
+
+典型往返：
+
+```
+agent 建模 → deliver STEP → 插件出图 → 你看出问题 → 拾取面/边/点 + 三点取样 → 交接单（Markdown）
+   ↑                                                                                    │
+   └──────────────────── 把路径丢给 agent，它照坐标改模型 ←───────────────────────────────┘
+```
+
+它**不建模型、不改模型、不启动 SOLIDWORKS**——建模是 sw-mcp 的事，这里只负责「看见」和「说清哪里不对」。
 
 - 包名 `dsh-sw-3d-preview`，版本 `0.2.2`（[CHANGELOG](./CHANGELOG.md)），MIT
 
@@ -161,7 +171,7 @@ node scripts/check-refs.mjs --strict   # 校验文档里 client.js:NNN 这类引
 index.js            49,775       Host 半边：8 条 /sw3d/* 路由
 client.js        2,533,655       浏览器半边（含内联 three.js r187）
 cordis.patch.yml     1,441       只 insert 一行插件
-package.json         2,070
+package.json         2,106
 README.md                         本文件（字节数随编辑变化，不列）
 CHANGELOG.md                      字节数随编辑变化，不列
 lib\mesh.js         45,600

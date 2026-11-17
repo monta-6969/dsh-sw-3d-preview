@@ -1,10 +1,20 @@
 # dsh-sw-3d-preview
 
-**Look at 3D models right inside the DSH file preview panel — and turn "that spot right there" into a coordinate an agent can use.**
+**The eyes of the SOLIDWORKS modelling-automation loop: draw the part an agent just built, so you can see whether it built it right.**
 
-DSH cannot open `.step` / `.sldprt` files. This plugin parses STEP / STL / OBJ into meshes and draws them in the preview panel,
-with section cuts and caps, face / edge / point picking, three-point sampling, annotations written to disk, and a Markdown handoff sheet —
-so "the fillet next to that boss" becomes a set of coordinates you can hand straight to an agent.
+In DSH, an agent drives SOLIDWORKS through sw-mcp to build parts, but all you get back is text — you cannot see whether the shape is correct,
+and neither can the model. This plugin closes that gap: it parses the delivered STEP/STL/OBJ into a mesh and draws it in the file preview panel.
+You look at it, confirm it, and turn "that face is wrong" into an annotation of **face id + coordinates** that goes back to the agent to fix.
+
+A typical round trip:
+
+```
+agent builds → deliver STEP → plugin draws it → you spot the problem → pick faces/edges/points + three-point sampling → handoff sheet (Markdown)
+   ↑                                                                                                  │
+   └─────────────────── give the agent the path; it rebuilds from those coordinates ←──────────────────┘
+```
+
+It does **not** build models, modify models, or launch SOLIDWORKS — building is sw-mcp's job. This plugin's job is to see, and to say exactly what is wrong.
 
 - Package `dsh-sw-3d-preview`, version `0.2.2` ([CHANGELOG](./CHANGELOG.md)), MIT
 
@@ -161,7 +171,7 @@ node scripts/check-refs.mjs --strict   # verify client.js:NNN style references i
 index.js            49,775       Host half: 8 /sw3d/* routes
 client.js        2,533,655       Browser half (with three.js r187 inlined)
 cordis.patch.yml     1,441       Inserts exactly one plugin row
-package.json         2,070
+package.json         2,106
 README.md                         This file (byte count changes with edits, not listed)
 CHANGELOG.md                      Byte count changes with edits, not listed
 lib\mesh.js         45,600

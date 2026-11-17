@@ -6,7 +6,7 @@
   "repository": { "type": "git", "url": "git+https://github.com/monta-6969/dsh-sw-3d-preview.git" },
   "homepage": "https://github.com/monta-6969/dsh-sw-3d-preview#readme",
   "bugs": { "url": "https://github.com/monta-6969/dsh-sw-3d-preview/issues" },
-  "description": "在文件预览面板里查看 3D 成果：STEP/STL/OBJ → S3DM v2 网格，支持面/边拾取、三点法标注、剖切封盖与标注交接单",
+  "description": "SOLIDWORKS 建模自动化的预览与反馈环节：把 agent deliver 出的 STEP/STL/OBJ 画进 DSH 文件预览面板，拾取面/边/点并生成坐标交接单交回 agent 修改",
   "icon": "./icon.svg",
   "keywords": [
     "dsh",
